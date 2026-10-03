@@ -6,14 +6,16 @@
 // ANCESTOR of the provider's cwd and therefore steering input the model reads. Only B4's
 // `--setting-sources user` + `--strict-mcp-config` make the narrower cwd a net win. Split them and the
 // intermediate commit is worse than doing nothing.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
-import { mkdtemp, writeFile, mkdir, symlink, chmod, lstat, realpath } from "node:fs/promises";
+import { mkdtemp, writeFile, mkdir, symlink, chmod, lstat, realpath, stat, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hardenedProvider } from "../src/harden";
-import { claudeShaped, resolveCliPath, providerCwd } from "../src/harden";
+import { claudeShaped, resolveCliPath, providerCwd, providerCwdTmpFallback } from "../src/harden";
 import { BYOCliProvider } from "../src/provider";
 import { ProviderError } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const fast = { probeMs: 3_000, flushMs: 150 };
 
@@ -36,7 +38,7 @@ test("B4: injects --tools= as a SINGLE token, and the prompt stays LAST in arg-m
   // `--tools` is variadic, so `--tools ""` as two tokens would swallow the positional prompt — the CLI
   // would receive the briefing prompt as a tool name and the prompt itself would vanish. The single
   // `--tools=` token is a correctness requirement, not a style choice.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b4-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b4-")));
   const cli = await fakeClaude(dir);
   const hp = hardenedProvider({ cli, argv: [], promptVia: "arg" }, fast);
   const out = await hp.generate("THE-PROMPT");
@@ -47,7 +49,7 @@ test("B4: injects --tools= as a SINGLE token, and the prompt stays LAST in arg-m
 });
 
 test("B4: injects --setting-sources user and --strict-mcp-config when the probe finds them", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-b4b-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b4b-")));
   const cli = await fakeClaude(dir);
   const out = await hardenedProvider({ cli, argv: [], promptVia: "stdin" }, fast).generate("x");
   expect(out).toContain("--setting-sources user");
@@ -57,14 +59,14 @@ test("B4: injects --setting-sources user and --strict-mcp-config when the probe 
 test("B4: sets CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 in the environment", async () => {
   // Preferred over `--no-session-persistence` because an unknown ENV VAR is ignored while an unknown
   // FLAG is fatal — the env var is safe on any CLI version, the flag is not.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b4c-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b4c-")));
   const cli = await fakeClaude(dir);
   const out = await hardenedProvider({ cli, argv: [], promptVia: "stdin" }, fast).generate("x");
   expect(out).toContain("SKIP:[1]");
 });
 
 test("B4: injects NOTHING the probe did not find", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-b4d-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b4d-")));
   const cli = await fakeClaude(dir, { help: "--tools" });   // only --tools listed
   const out = await hardenedProvider({ cli, argv: [], promptVia: "stdin" }, fast).generate("x");
   expect(out).toContain("--tools=");
@@ -73,7 +75,7 @@ test("B4: injects NOTHING the probe did not find", async () => {
 });
 
 test("B4: injects nothing for a NON-claude-shaped cli, even if --help lists the flags", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-b4e-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b4e-")));
   const cli = await fakeClaude(dir, { name: "codex" });
   const out = await hardenedProvider({ cli, argv: [], promptVia: "stdin" }, fast).generate("x");
   expect(out).toContain("ARGV:[]");
@@ -93,7 +95,7 @@ test("B4: claude-shaped detection strips Windows extensions and is case-insensit
 // ── B1/B3: the working directory ────────────────────────────────────────────────────────────────────
 
 test("B1: the provider runs in a narrow cwd that is CREATED if missing, not reported as missing-binary", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-b1-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b1-")));
   const cli = await fakeClaude(dir);
   const state = join(dir, "state");                          // does not exist yet
   const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: state });
@@ -109,7 +111,7 @@ test("B1: the provider runs in a narrow cwd that is CREATED if missing, not repo
 });
 
 test("B1: the cwd path is STABLE across calls — a per-call mkdtemp would scatter transcript slugs", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-b1b-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b1b-")));
   const cli = await fakeClaude(dir);
   const state = join(dir, "state");
   const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: state });
@@ -122,9 +124,9 @@ test("B1: an EXPLICIT opts.cwd wins over the computed narrow cwd", async () => {
   // Precedence pinned deliberately, not left to whichever spread came last. Without it, the `cwd` field
   // added for B1 would be dead for every caller, and `harden: false` would honour it while
   // `harden: true` ignored it.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b1c-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b1c-")));
   const cli = await fakeClaude(dir);
-  const explicit = await mkdtemp(join(tmpdir(), "dba-explicit-"));
+  const explicit = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-explicit-")));
   const out = await hardenedProvider({ cli, argv: [], promptVia: "stdin" },
     { ...fast, stateDir: join(dir, "state"), cwd: explicit }).generate("x");
   expect(out).toContain(explicit.split("/").pop()!);
@@ -132,8 +134,23 @@ test("B1: an EXPLICIT opts.cwd wins over the computed narrow cwd", async () => {
 });
 
 test("B3: an unusable stateDir FALLS BACK and warns — it must never be fatal", async () => {
+  // The suite's only creator of the provider's STABLE tmp fallback cwd, registered first — before anything
+  // that can throw, so a failing assertion below still registers it. Safe to remove at run end:
+  // `providerCwd` re-mkdirs it, and a live product process on that rung re-runs in its own cwd with a
+  // warning (harden.ts "became unusable"). Two `bun test` runs sharing one TMPDIR share this one path too;
+  // a private TMPDIR avoids that. Note what does and does not catch its ABSENCE: no assertion here does,
+  // so a single-file run stays green without it (measured). Its only detector is the run-end drain
+  // leaving only the two `dba-isolated-*` baselines in TMPDIR across a FULL run — a leak guard, not a suite
+  // assertion.
+  removeAtRunEnd(providerCwdTmpFallback());
+  // …and clear it: a leftover from a run killed before the drain would satisfy the assertion below
+  // without the tmp rung ever being reached. It is already registered, so run-end cleanup is unaffected.
+  // ⚠ This line must stay BELOW the registration. A recursive rm of whatever a product-code builder
+  // returns is bounded by exactly one thing: `removeAtRunEnd` throws unless that path is a direct child
+  // of `tmpdir()`, so the line above is what validates the line below. Swapping them removes the bound.
+  await rm(providerCwdTmpFallback(), { recursive: true, force: true });
   // A briefing is worth more than a narrow cwd. Every rung of the ladder degrades and warns.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b3-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b3-")));
   const cli = await fakeClaude(dir);
   const blocker = join(dir, "blocked");
   await writeFile(blocker, "not a directory");               // mkdir under a FILE cannot succeed
@@ -141,13 +158,21 @@ test("B3: an unusable stateDir FALLS BACK and warns — it must never be fatal",
   const out = await hp.generate("x");
   expect(out).toContain("ARGV:");                            // still produced a briefing
   expect(hp.runtimeWarnings.join(" ")).toMatch(/cwd|working directory/i);
+  // This test is the suite's only CREATOR of that directory, and the registration above names it from
+  // harden.ts's own builder rather than a second copy of the string. What that buys, stated exactly:
+  // a RENAME inside `providerCwdTmpFallback()` does NOT turn this red (measured) — registration and
+  // assertion both call the builder, so they move together. The two things it DOES pin, both measured
+  // red: `cwdOnce`'s call site diverging from the exported builder (harden.ts:323 — the suite would then
+  // register one path while the product created another, re-leaking a directory nothing registers), and
+  // the tmp rung actually being reached by this run rather than by an earlier one.
+  expect(await stat(providerCwdTmpFallback()).then((s) => s.isDirectory())).toBe(true);
 });
 
 test("B3: a SYMLINKED fallback is REJECTED — lstat does not follow it (squat resistance)", async () => {
   // The tmp rung uses a PREDICTABLE name, and `mkdir(recursive)` succeeds silently on an existing
   // directory — so an attacker who pre-creates it would choose the provider's cwd. Reject anything that
   // is a symlink, not 0700, or not ours.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b3b-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b3b-")));
   const target = join(dir, "elsewhere");
   await mkdir(target);
   // 0700 and owned by us DELIBERATELY: with a 0755 target the mode check rejected it and the test
@@ -163,27 +188,57 @@ test("B3: a SYMLINKED fallback is REJECTED — lstat does not follow it (squat r
   expect(ok).toBe(false);
 });
 
-test("B3: a WORLD-WRITABLE directory is REJECTED even though we could chmod it", async () => {
-  // The one case repair must NOT paper over: anyone could already have planted a CLAUDE.md or .mcp.json
-  // inside, and the provider's cwd is precisely where those are read from. Tightening the mode afterwards
-  // does not un-plant a file, so the directory is untrustworthy regardless.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b3c-"));
+// A directory WRITABLE by anyone else is REFUSED, never repaired — the one case repair must NOT paper
+// over: anyone could already have planted a CLAUDE.md or .mcp.json inside, and the provider's cwd is
+// precisely where those are read from. Tightening the mode afterwards does not un-plant a file, so the
+// directory is untrustworthy regardless. The "a chmod cannot un-plant a file" argument applies
+// identically to group-write, and on macOS every local user is in `staff` — so repairing 0770 would
+// apply an argument to one case that we reject for the other. Group-READABLE (0750) is still repaired
+// (see the REPAIRED table below); only write access is disqualifying.
+//
+// Rows: [name, mode, tmpFallback, expected]. The 0777 and 0757 rows hand the loose directory in as its
+// OWN fallback, so the only honest outcome is `ok: false`; the 0770 row keeps its separate fallback and
+// pins that the loose directory is not the cwd chosen. The 0757 row exists because a reject mask that
+// checks only group-write (`0o022` → `0o020`) survived every other test in this file: 0777 and 0770 are
+// both group-writable, so nothing pinned the OTHER-write bit on its own.
+test.each([
+  ["WORLD-WRITABLE (0777)", 0o777, "self", { ok: false }],
+  ["OTHER-writable only (0757)", 0o757, "self", { ok: false }],
+  ["GROUP-WRITABLE (0770)", 0o770, "fb", { ok: true }],
+] as const)("B3: a %s directory is REFUSED, not repaired", async (_name, mode, fallback, expected) => {
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-refuse-")));
   const loose = join(dir, "loose");
-  await mkdir(loose, { mode: 0o777 });
-  await chmod(loose, 0o777);
-  const { ok } = await providerCwd({ preferred: loose, tmpFallback: loose });
-  expect(ok).toBe(false);
+  await mkdir(loose, { mode });
+  await chmod(loose, mode);
+  const fb = join(dir, "fb");
+  const r = await providerCwd({ preferred: loose, tmpFallback: fallback === "self" ? loose : fb });
+  expect(r.ok).toBe(expected.ok);
+  expect(r.cwd).not.toBe(loose);
+  expect(r.cwd).toBe(fallback === "self" ? undefined : fb);
+  // …and it was not silently "repaired" on the way to being refused.
+  expect((await lstat(loose)).mode & 0o777).toBe(mode);
 });
 
 // ── B2: absolute cli resolution ─────────────────────────────────────────────────────────────────────
 
-test("B3: a GROUP-readable (0750) directory we own is REPAIRED, not refused", async () => {
-  // The other side of the repair/reject line: group-READABLE is a confidentiality slip in a directory we
-  // own, so tighten it and carry on. Anything WRITABLE by group or other is refused outright instead,
-  // because that one may already contain planted files and a chmod cannot undo that.
-  const dir = await mkdtemp(join(tmpdir(), "dba-group-"));
-  const g = join(dir, "grouped");
-  await mkdir(g); await chmod(g, 0o750);
+// The other side of the repair/reject line. Anything that is merely too open, or not searchable, in a
+// directory WE OWN is repaired to 0700 and used; anything WRITABLE by group or other is refused outright
+// instead (table above), because that one may already contain planted files and a chmod cannot undo that.
+//  • 0750 — group-READABLE is a confidentiality slip in a directory we own, so tighten it and carry on.
+//  • 0600 — measured: a 0600 dir passed the original check and `Bun.spawn` then failed with EACCES naming
+//    the BINARY — `chdir(2)` needs the search bit. Refusing it would have been a worse fix than repairing
+//    it: the directory is ours, so making it right is both safe and what the user wants.
+//  • 0755 — `mkdir(recursive, mode)` does NOT re-apply the mode to an existing directory (measured: 0755
+//    survived). Without an explicit repair, a provider-cwd created once under a bad umask stays
+//    world-readable forever and every later run re-accepts it.
+test.each([
+  ["GROUP-readable (0750)", 0o750],
+  ["NON-SEARCHABLE (0600)", 0o600],
+  ["LOOSE-mode (0755)", 0o755],
+])("B3: a %s directory we own is REPAIRED to 0700 and used, not refused", async (_name, mode) => {
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-repair-")));
+  const g = join(dir, "ours");
+  await mkdir(g); await chmod(g, mode);
   const r = await providerCwd({ preferred: g, tmpFallback: join(dir, "fb") });
   expect(r.cwd).toBe(g);
   expect((await lstat(g)).mode & 0o777).toBe(0o700);
@@ -193,7 +248,7 @@ test("B2: generate() actually USES resolveCliPath — a relative cli survives th
   // The three B2 tests exercised the helper in isolation with literal strings; nothing pinned that the
   // call site uses it, so `cli: cfg.cli` survived the suite. This is the integration the commit message
   // calls load-bearing ("the morning dies with no retry on a wrapper that exists").
-  const dir = await mkdtemp(join(tmpdir(), "dba-relcli-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-relcli-")));
   await fakeClaude(dir);
   const prevCwd = process.cwd();
   process.chdir(dir);                                        // so "./claude" is relative to somewhere real
@@ -229,7 +284,7 @@ test("B2: an absolute path is unchanged, and ~ is expanded", () => {
 test("B9: harden:false injects nothing, skips the probe entirely, and enumerates what was surrendered", async () => {
   // All-or-nothing on purpose: a user opting back into tools via `--tools default` would otherwise
   // silently lose ALL MCP servers (measured 2 → 0) with no way to decline.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b9-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b9-")));
   const cli = await fakeClaude(dir);
   const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin", harden: false }, fast);
   const out = await hp.generate("x");
@@ -244,7 +299,7 @@ test("B9: harden:false does not spawn a probe at all — counted, not inferred",
   // The old assertion matched /probe/i against the warnings, which could only ever match the memo's
   // catch text — and that never fires, because probeCapabilities is non-rejecting by construction. So a
   // mutant that fired `void caps()` inside the !harden branch passed. Count the spawns instead.
-  const dir = await mkdtemp(join(tmpdir(), "dba-noprobe-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-noprobe-")));
   const cli = join(dir, "claude");
   const log = join(dir, "spawns.log");
   await writeFile(cli, `#!/bin/sh\necho "CALL:$*" >> ${log}\necho ok\n`, { mode: 0o755 });
@@ -258,7 +313,7 @@ test("B9: harden:false does not spawn a probe at all — counted, not inferred",
 test("B10: an opts.env entry passed through hardenedProvider reaches the child", async () => {
   // Latent today (no production caller passes env), but the passthrough was unpinned: dropping
   // `...opts.env` from the merge survived the suite.
-  const dir = await mkdtemp(join(tmpdir(), "dba-envpass-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-envpass-")));
   const cli = join(dir, "claude");
   await writeFile(cli, "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo '--tools'; exit 0; fi\necho \"V:[$DBA_PASS]\"\n", { mode: 0o755 });
   const out = await hardenedProvider({ cli, argv: [], promptVia: "stdin" },
@@ -268,35 +323,11 @@ test("B10: an opts.env entry passed through hardenedProvider reaches the child",
 
 // ── Security-review fixes (activation round) ────────────────────────────────────────────────────────
 
-test("B3: a NON-SEARCHABLE (0600) directory we own is REPAIRED to 0700, so it is actually usable", async () => {
-  // Measured: a 0600 dir passed the original check and `Bun.spawn` then failed with EACCES naming the
-  // BINARY — `chdir(2)` needs the search bit. Refusing it would have been a worse fix than repairing it:
-  // the directory is ours, so making it right is both safe and what the user wants.
-  const dir = await mkdtemp(join(tmpdir(), "dba-nosearch-"));
-  const bad = join(dir, "nosearch");
-  await mkdir(bad); await chmod(bad, 0o600);
-  const r = await providerCwd({ preferred: bad, tmpFallback: join(dir, "fb") });
-  expect(r.cwd).toBe(bad);
-  expect((await lstat(bad)).mode & 0o777).toBe(0o700);
-});
-
-test("B3: an existing directory with a LOOSE mode is repaired to 0700, not silently accepted", async () => {
-  // `mkdir(recursive, mode)` does NOT re-apply the mode to an existing directory (measured: 0755
-  // survived). Without an explicit repair, a provider-cwd created once under a bad umask stays
-  // world-readable forever and every later run re-accepts it.
-  const dir = await mkdtemp(join(tmpdir(), "dba-repair-"));
-  const loose = join(dir, "loose");
-  await mkdir(loose); await chmod(loose, 0o755);
-  const r = await providerCwd({ preferred: loose, tmpFallback: join(dir, "fb") });
-  expect(r.cwd).toBe(loose);
-  expect((await lstat(loose)).mode & 0o777).toBe(0o700);
-});
-
 test("B3: an UNREACHABLE cwd is retryable and names the cwd — never missing-binary", async () => {
   // `Bun.spawn` reports an unreachable cwd as ENOENT naming the BINARY, so the old classification
   // called it missing-binary — which withRetry treats as PERMANENT. The morning died with zero
   // retries and the message "CLI not found", about a CLI that is installed and working.
-  const dir = await mkdtemp(join(tmpdir(), "dba-badcwd-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-badcwd-")));
   const p = new BYOCliProvider({ cli: "/bin/echo", argv: [], promptVia: "stdin" }, { cwd: join(dir, "vanished") });
   const e: unknown = await p.generate("x").then(() => { throw new Error("expected a rejection"); }, (err: unknown) => err);
   expect((e as ProviderError).code).toBe("nonzero-exit");        // retryable, not permanent
@@ -308,7 +339,7 @@ test("B1+B4: the narrow cwd is NOT applied when the isolation flag was not injec
   // ~/CLAUDE.md an ancestor. So the cwd move must be gated on --setting-sources actually going in,
   // not merely on the directory being creatable. Measured before the fix: three reachable paths moved
   // the cwd with zero or partial flags, two of them silently.
-  const dir = await mkdtemp(join(tmpdir(), "dba-gate-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-gate-")));
   const cli = await fakeClaude(dir, { help: "--tools" });        // --setting-sources NOT listed
   const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
   const out = await hp.generate("x");
@@ -318,7 +349,7 @@ test("B1+B4: the narrow cwd is NOT applied when the isolation flag was not injec
 });
 
 test("B4: a NON-claude-shaped cli says so, rather than silently doing nothing", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-shape-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-shape-")));
   const cli = await fakeClaude(dir, { name: "codex" });
   const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
   await hp.generate("x");
@@ -329,7 +360,7 @@ test("B4: a NON-claude-shaped cli says so, rather than silently doing nothing", 
 test("probe anomaly: the warning must not claim the cwd change didn't happen when it did", async () => {
   // The old wording was "provider hardening not applied", which is false on the anomaly path if the
   // cwd still moved — telling the user nothing happened when the riskier half did.
-  const dir = await mkdtemp(join(tmpdir(), "dba-anom-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-anom-")));
   const cli = join(dir, "claude");
   await writeFile(cli, "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 3; fi\necho ok\n", { mode: 0o755 });
   const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
@@ -345,7 +376,7 @@ test("B2+B5: a TILDE-configured cli is resolved for the PROBE too, not only for 
   // `~/.local/bin/claude` config — the exact shape B2 exists to support, and the shape of this machine's
   // real config — `Bun.spawn(["~/…","--help"])` is ENOENT, so the probe anomalied and ZERO flags were
   // ever injected, with a daily warning blaming a CLI that works perfectly.
-  const home = await mkdtemp(join(tmpdir(), "dba-home-"));
+  const home = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-home-")));
   await fakeClaude(home);                                    // lives at <fakeHome>/claude
   const hp = hardenedProvider({ cli: "~/claude", argv: [], promptVia: "stdin" },
     { ...fast, stateDir: join(home, "state"), home });
@@ -359,7 +390,7 @@ test("B5: a NON-claude cli is never probed — counted, not inferred", async () 
   // probing was invisible to it. A codex/wrapper user should not pay a `--help` spawn every morning for
   // an answer that is discarded, nor risk a spurious anomaly warning about a CLI that was never a
   // candidate for injection.
-  const dir = await mkdtemp(join(tmpdir(), "dba-noprobe2-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-noprobe2-")));
   const cli = join(dir, "codex");
   const log = join(dir, "spawns.log");
   await writeFile(cli, `#!/bin/sh\necho "CALL:$*" >> ${log}\necho ok\n`, { mode: 0o755 });
@@ -370,22 +401,11 @@ test("B5: a NON-claude cli is never probed — counted, not inferred", async () 
   expect(calls.some((c) => c.includes("--help"))).toBe(false);
 });
 
-test("B3: a GROUP-WRITABLE (0770) directory is REFUSED, not repaired", async () => {
-  // The "a chmod cannot un-plant a file" argument applies identically to group-write, and on macOS every
-  // local user is in `staff` — so repairing 0770 would apply an argument to one case that we reject for
-  // the other. Group-READABLE (0750) is still repaired; only write access is disqualifying.
-  const dir = await mkdtemp(join(tmpdir(), "dba-grpw-"));
-  const g = join(dir, "grpw");
-  await mkdir(g); await chmod(g, 0o770);
-  const r = await providerCwd({ preferred: g, tmpFallback: join(dir, "fb") });
-  expect(r.cwd).not.toBe(g);
-});
-
 test("B3: a SYMLINKED parent is judged on its TARGET, not on the link's own mode", async () => {
   // `lstat` on the parent reported the SYMLINK's mode (0120755 on macOS — never world-writable), so a
   // parent that was a link to a 0777 non-sticky directory passed the very check added to reject it. The
   // leaf still uses lstat, where not-following IS the protection.
-  const base = await mkdtemp(join(tmpdir(), "dba-plink-"));
+  const base = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-plink-")));
   const wide = join(base, "wide");
   await mkdir(wide); await chmod(wide, 0o777);      // world-writable, non-sticky
   const viaLink = join(base, "viaLink");
@@ -401,7 +421,7 @@ test("B3: a STICKY world-writable parent is ACCEPTED — the exemption is load-b
   // rung, so without it the fallback would be refused outright and the narrow cwd silently lost.
   // Shelled out to `chmod` deliberately: Bun's fs.chmod DROPS S_ISVTX on macOS (measured — 0o1777 yields
   // mode 40777), which is very likely why this case was never covered.
-  const base = await mkdtemp(join(tmpdir(), "dba-sticky-"));
+  const base = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-sticky-")));
   const parent = join(base, "stickyparent");
   await mkdir(parent);
   await Bun.spawn(["chmod", "1777", parent]).exited;
@@ -417,7 +437,7 @@ test("B3: a directory NOT owned by us is refused — the one check an attacker c
   // three comments described it as the wall an attacker cannot climb. It cannot be exercised in-process
   // with the real uid — the suite has only one — so `providerCwd` takes the uid as a parameter and this
   // drives a mismatch, which is exactly the attacker's situation: a directory they own, not us.
-  const dir = await mkdtemp(join(tmpdir(), "dba-notours-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-notours-")));
   const theirs = join(dir, "theirs");
   await mkdir(theirs, { mode: 0o700 });
   const r = await providerCwd({ preferred: theirs, tmpFallback: theirs, uid: (process.getuid?.() ?? 0) + 12345 });

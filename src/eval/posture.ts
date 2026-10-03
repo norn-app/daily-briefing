@@ -57,7 +57,29 @@ export const isPostureWarning = (w: string) => POSTURE_MARKERS.some((m) => w.inc
  *  That duplication is the price of the guard being able to see the channel at all, and
  *  `test/provider.incomplete-read.test.ts` pins that the emitted text still contains this substring. */
 export const TRUNCATION_SENTINEL = "its output stream never closed";
-export const isTruncationWarning = (w: string) => w.includes(TRUNCATION_SENTINEL);
+
+/** A3. The API transports' own truncation cause — the MODEL hit its output ceiling, not a held pipe.
+ *
+ *  ⚠ A SEPARATE CONSTANT, deliberately NOT an overload of TRUNCATION_SENTINEL, whose text is
+ *  stream-specific ("a background process is holding it open"). The two facts have different causes and
+ *  different fixes (raise `provider.api.maxTokens` vs. chase a pipe-holding grandchild), and a sentinel
+ *  that means two things is a column that means neither. Both feed the SAME ` · truncated` mark on the
+ *  posture line, because to a reader of EVAL.md "this result was cut off" is one fact. */
+export const API_TRUNCATION_SENTINEL = "stopped at its output-token limit";
+
+/** A3. The carve-out sentinel for an API transport. The emitted warning deliberately ALSO contains
+ *  "provider hardening" so `isPostureWarning` classifies it as posture at all — a warning outside that
+ *  vocabulary is filtered out before `posturePhrase` ever sees it, and the carve-out would be dead. */
+export const API_TRANSPORT_SENTINEL = "no CLI process to harden";
+
+/** A3. Plain http to a NON-loopback endpoint. Deliberately NOT posture: it describes the
+ *  CONFIDENTIALITY OF THE WIRE, not the provider's authority, and it is a user configuration rather
+ *  than a malfunction — classifying it as posture would flip every such run to `degraded`, reporting a
+ *  considered (if unwise) choice as a broken machine. Named in test/posture.test.ts's NON_POSTURE list. */
+export const API_CLEARTEXT_SENTINEL = "sent in cleartext over plain http";
+
+export const isTruncationWarning = (w: string) =>
+  w.includes(TRUNCATION_SENTINEL) || w.includes(API_TRUNCATION_SENTINEL);
 
 /** ` · truncated` when any warning says the output was cut off, else "". NOT exported and NOT a
  *  separate call: it is folded into `postureLine` below. It began life as a sibling helper, and every
@@ -76,16 +98,28 @@ const isOptOut = (w: string) => w.includes("DISABLED by config");
  *  signal this field exists to carry. */
 const isUnhardenable = (w: string) => w.includes("is not recognised as the claude CLI");
 
-/** One word for the posture: `full`, `off (by config)`, or `degraded`. */
+/** A3. An API transport spawns nothing, so there is no child to harden — expected, not a malfunction.
+ *  EXACTLY the same carve-out reasoning as `isUnhardenable`: without it, an API user reads `degraded` on
+ *  every row forever, which dilutes the one signal this field exists to carry. `full` is equally wrong
+ *  in the opposite direction — it would assert a hardening property that was never applied, which is the
+ *  provenance hole this whole module exists to close. */
+const isApiTransport = (w: string) => w.includes(API_TRANSPORT_SENTINEL);
+
+/** One word for the posture: `full`, `off (by config)`, `unhardened (non-claude CLI)`,
+ *  `unhardened (api provider)`, or `degraded`. */
 export function posturePhrase(warnings: readonly string[]): string {
   const relevant = warnings.filter(isPostureWarning);
   if (relevant.length === 0) return "full";
-  // Both carve-outs describe EXPECTED states, so a run containing only expected states is not degraded —
-  // reporting it as such would be the same misreport the carve-outs exist to prevent, just with two of
-  // them present instead of one. The explicit config choice dominates when both apply.
-  const isExpected = (w: string) => isOptOut(w) || isUnhardenable(w);
+  // All three carve-outs describe EXPECTED states, so a run containing only expected states is not
+  // degraded — reporting it as such would be the same misreport the carve-outs exist to prevent, just
+  // with more than one of them present. The explicit config choice dominates when several apply.
+  const isExpected = (w: string) => isOptOut(w) || isUnhardenable(w) || isApiTransport(w);
   if (relevant.every(isExpected)) {
-    return relevant.some(isOptOut) ? "off (by config)" : "unhardened (non-claude CLI)";
+    if (relevant.some(isOptOut)) return "off (by config)";
+    // `api provider` beats `non-claude CLI` when both appear: the api carve-out is the MORE SPECIFIC
+    // true statement (there is no CLI at all, claude-shaped or otherwise), and the synthesized transport
+    // label is deliberately never claude-shaped, so the two genuinely can co-occur.
+    return relevant.some(isApiTransport) ? "unhardened (api provider)" : "unhardened (non-claude CLI)";
   }
   return "degraded";
 }
@@ -104,7 +138,9 @@ export function postureLine(warnings: readonly string[]): string {
   // provenance hole C2 closed for hardening, reopened one warning later for streams.
   const cut = truncationMark(warnings);
   if (phrase === "full") return `posture: full${cut}`;
-  if (phrase === "unhardened (non-claude CLI)") return `posture: ${phrase}${cut}`;
+  // The two bare-phrase carve-outs: both already SAY what was lost and why, so appending a detail tail
+  // would repeat the same sentence into a 190-char budget that exists for the degraded case.
+  if (phrase === "unhardened (non-claude CLI)" || phrase === "unhardened (api provider)") return `posture: ${phrase}${cut}`;
   const detail = [...new Set(warnings.filter(isPostureWarning))]
     .map(cellSafe)
     .join(" · ");

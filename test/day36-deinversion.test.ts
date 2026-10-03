@@ -2,6 +2,7 @@
 // (clusterRecap + render nesting), merge attribution by first-parent file plurality (mergeLabel via
 // unitForFiles), the recap count header, and the audit-invariance pin (constraint 2 of the design:
 // the deterministic audit layer must return IDENTICAL results on clustered and flat renders).
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect, describe } from "bun:test";
 import { clusterRecap, generateBriefing } from "../src/generator";
 import { renderBriefing } from "../src/render";
@@ -10,8 +11,9 @@ import { extractCitedShas, missingSameDay, coverageGaps } from "../src/audit";
 import { listPrMerges } from "../src/git";
 import { runCore } from "../src/core";
 import { localMidnight } from "../src/time";
-import { buildRepo, commitFiles, branchCommit, mergeBranchWith } from "./fixtures/build-repo";
+import { buildRepo, branchCommit, mergeBranchWith } from "./fixtures/build-repo";
 import type { ReducedContext, Activity, BriefingStruct, Config, Provider } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const commit = (sha: string, repo: string, diffstat: { file: string; added: number; removed: number }[], iso: string): Activity =>
   ({ source: "git", kind: "commit", event_id: sha, repo, timestamp: iso, text: `c-${sha}`, meta: { diffstat } });
@@ -24,7 +26,11 @@ describe("clusterRecap — pure", () => {
   test("two entries whose commits share a dominant file are stamped with one group; a third on another file is not", () => {
     const ctx = ctxOf([
       commit("aaaa111", "/r", [{ file: "core/ledger.py", added: 10, removed: 2 }], d18),
-      commit("bbbb222", "/r", [{ file: "core/ledger.py", added: 7, removed: 1 }, { file: "tests/t.py", added: 1, removed: 0 }], d19),
+      // notes.md is source-class on purpose: it participates in the churn contest and LOSES on
+      // churn, which is what this fixture has always demonstrated. (It was tests/t.py until the
+      // source-preferred keying change, after which the predicate dropped it before churn was
+      // consulted and the row demonstrated nothing.)
+      commit("bbbb222", "/r", [{ file: "core/ledger.py", added: 7, removed: 1 }, { file: "notes.md", added: 1, removed: 0 }], d19),
       commit("cccc333", "/r", [{ file: "other.py", added: 3, removed: 0 }], d18),
     ]);
     const out = clusterRecap([
@@ -60,6 +66,11 @@ describe("clusterRecap — pure", () => {
     ]);
     const out = clusterRecap([
       { repo: "app", text: "no evidence" },
+      // ⚠ NOT gate coverage, though it reads like it. `9999999` is all-digit: it used to be rejected
+      // by `resolveOne`'s shape test before reaching the hits filter, and since the gate became
+      // SHA_RE + a 7-char floor it clears the gate, scores zero hits, and the scan runs off the end
+      // of a single-token field. Same outcome by a different path — so this entry no longer covers
+      // "an all-digit token is skipped". That is pinned in `cluster-resolver-alldigit.test.ts`.
       { repo: "app", text: "unknown sha", evidence: "9999999" },
       { repo: "app", text: "ambiguous", evidence: "abc1234" },
       { repo: "app", text: "ambiguous too", evidence: "abc1234" },
@@ -78,6 +89,136 @@ describe("clusterRecap — pure", () => {
     ], ctx);
     expect(out[0]!.group).toContain("first.ts");
     expect(out[1]!.group).toBe(out[0]!.group);
+  });
+
+  // ── SOURCE-preferred keying (days 45 + 47, both judged) ───────────────────────────────────────
+  test("a churn-heavy shared TEST file does not own the key: the cluster keys on the dominant SOURCE file", () => {
+    // Day-45 shape verbatim: every commit's biggest churn is the shared test file; the story the
+    // reader needs is the source it guards. Raw max-churn keyed this on test_m7_agent.py.
+    const ctx = ctxOf([
+      commit("aaaa111", "/r", [{ file: "tests/test_m7_agent.py", added: 40, removed: 10 }, { file: "agent/loop.py", added: 12, removed: 3 }], d18),
+      commit("bbbb222", "/r", [{ file: "tests/test_m7_agent.py", added: 25, removed: 5 }, { file: "agent/loop.py", added: 8, removed: 1 }], d19),
+    ]);
+    const out = clusterRecap([
+      { repo: "app", text: "one", evidence: "aaaa111" },
+      { repo: "app", text: "two", evidence: "bbbb222" },
+    ], ctx);
+    expect(out[0]!.group).toBe("agent/loop.py — 2 commits (Aug 18–19)");
+    expect(out[1]!.group).toBe(out[0]!.group);
+  });
+
+  test("a commit touching ONLY test-like paths falls back to raw churn: a pure test lane still clusters", () => {
+    const ctx = ctxOf([
+      commit("aaaa111", "/r", [{ file: "tests/test_m3.py", added: 9, removed: 0 }, { file: "tests/helpers.py", added: 2, removed: 0 }], d18),
+      commit("bbbb222", "/r", [{ file: "tests/test_m3.py", added: 4, removed: 1 }], d18),
+    ]);
+    const out = clusterRecap([
+      { repo: "app", text: "one", evidence: "aaaa111" },
+      { repo: "app", text: "two", evidence: "bbbb222" },
+    ], ctx);
+    expect(out[0]!.group).toBe("tests/test_m3.py — 2 commits (Aug 18)");
+    expect(out[1]!.group).toBe(out[0]!.group);
+  });
+
+  test("MIXED-lane residual, pinned as documented: a test-only member splits from its source-keyed siblings", () => {
+    // The docblock's stated residual — failure mode is the flat shape, never a wrong claim. The
+    // test-only commit keys on the test file (singleton → no stamp); the two source-touching
+    // commits key on the source and still cluster.
+    const ctx = ctxOf([
+      commit("aaaa111", "/r", [{ file: "tests/test_x.py", added: 30, removed: 0 }, { file: "x.py", added: 5, removed: 0 }], d18),
+      commit("bbbb222", "/r", [{ file: "x.py", added: 3, removed: 1 }], d18),
+      commit("cccc333", "/r", [{ file: "tests/test_x.py", added: 6, removed: 2 }], d18),
+    ]);
+    const out = clusterRecap([
+      { repo: "app", text: "one", evidence: "aaaa111" },
+      { repo: "app", text: "two", evidence: "bbbb222" },
+      { repo: "app", text: "test-only", evidence: "cccc333" },
+    ], ctx);
+    expect(out[0]!.group).toBe("x.py — 2 commits (Aug 18)");
+    expect(out[1]!.group).toBe(out[0]!.group);
+    expect(out[2]!.group).toBeUndefined();   // split, not misfiled — the documented safe failure
+  });
+
+  test("a tie among SOURCE rows takes the first such diffstat row, even behind a test row", () => {
+    // first.ts and second.ts tie at churn 2; the test row leads the diffstat with more churn than
+    // both. Pool order must preserve the original row order of the SOURCE rows.
+    const ctx = ctxOf([
+      commit("aaaa111", "/r", [{ file: "test/big.test.ts", added: 50, removed: 0 }, { file: "first.ts", added: 2, removed: 0 }, { file: "second.ts", added: 1, removed: 1 }], d18),
+      commit("bbbb222", "/r", [{ file: "first.ts", added: 5, removed: 0 }], d18),
+    ]);
+    const out = clusterRecap([
+      { repo: "app", text: "tie goes first source row", evidence: "aaaa111" },
+      { repo: "app", text: "plain", evidence: "bbbb222" },
+    ], ctx);
+    expect(out[0]!.group).toContain("first.ts");
+    expect(out[1]!.group).toBe(out[0]!.group);
+  });
+
+  test("MAX-CHURN selection is load-bearing: a later, bigger source row beats pool[0]", () => {
+    // ⚠ Review found deleting the churn loop (best stays pool[0]) survived the ENTIRE 1468-test
+    // suite — a pre-existing gap: the old test at "a tie takes the FIRST diffstat row" pins only
+    // the tie half of its own name. Here the max sits LAST in the diffstat, behind two smaller
+    // source rows, so first-wins and max-wins disagree.
+    const ctx = ctxOf([
+      commit("aaaa111", "/r", [{ file: "small.ts", added: 1, removed: 0 }, { file: "mid.ts", added: 3, removed: 0 }, { file: "big.ts", added: 9, removed: 2 }], d18),
+      commit("bbbb222", "/r", [{ file: "big.ts", added: 4, removed: 0 }], d18),
+    ]);
+    const out = clusterRecap([
+      { repo: "app", text: "one", evidence: "aaaa111" },
+      { repo: "app", text: "two", evidence: "bbbb222" },
+    ], ctx);
+    expect(out[0]!.group).toBe("big.ts — 2 commits (Aug 18)");
+    expect(out[1]!.group).toBe(out[0]!.group);
+  });
+
+  test("INCIDENTAL-TOUCH residual, pinned as documented: a tiny source row names a test-heavy cluster", () => {
+    // The docblock's third residual — the price of source-preference, stated not implied. Both
+    // commits are overwhelmingly a test rewrite; the 2-line VERSION touch wins the key and the
+    // story line carries its name. Factually true (VERSION is in both diffstats), editorially the
+    // fixed defect's mirror image, accepted as the tail case. If a churn threshold ever changes
+    // this, this test is the loud tripwire that the residual moved.
+    const ctx = ctxOf([
+      commit("aaaa111", "/r", [{ file: "tests/test_engine.py", added: 520, removed: 390 }, { file: "VERSION", added: 2, removed: 2 }], d18),
+      commit("bbbb222", "/r", [{ file: "tests/test_engine.py", added: 100, removed: 40 }, { file: "VERSION", added: 1, removed: 1 }], d18),
+    ]);
+    const out = clusterRecap([
+      { repo: "app", text: "one", evidence: "aaaa111" },
+      { repo: "app", text: "two", evidence: "bbbb222" },
+    ], ctx);
+    expect(out[0]!.group).toBe("VERSION — 2 commits (Aug 18)");
+    expect(out[1]!.group).toBe(out[0]!.group);
+  });
+
+  test("test-path predicate: real test shapes excluded, lookalike words are SOURCE", () => {
+    // Every fixture pairs one test-shaped row (bigger churn) with one lookalike row; the lookalike
+    // must win the key. If the predicate over-matches (e.g. bare substring "test"), the pair keys
+    // on nothing sensible and the group strings below fail.
+    const shapes: [string, string][] = [
+      ["tests/test_rev12b_runtime_role.py", "contest.py"],       // day-47's file; "contest" is source
+      ["__tests__/widget.ts", "latest.ts"],                      // __tests__ segment; "latest" is source
+      ["src/foo.spec.ts", "protest/march.ts"],                   // .spec. basename; "protest/" is not a test segment
+      ["test_root.py", "attestation.py"],                        // test_ prefix at repo root, no segment
+      ["pkg/util_test.go", "src/spectrum.ts"],                   // _test before extension; "spectrum" is source
+      // ⚠ The next four exist because the verify round killed nothing by reverting them: each pins
+      // one behaviour that previously survived the whole suite when mutated (case-insensitivity,
+      // the specs plural, the hyphen suffix, basename extraction).
+      ["SPECS/a.rb", "specification.rb"],                        // /i + specs? on the segment; no separator after "spec" = source
+      ["Tests/A.cs", "TestyMcTest.cs"],                          // /i on tests?; framework-style basename stays source (documented)
+      ["foo-test.go", "footest.go"],                             // -test hyphen suffix; glued "footest" is source
+      ["src/test_helpers.py", "src/latest_helpers.py"],          // test_ prefix on the BASENAME under a source dir; "latest_" is source
+    ];
+    for (const [testFile, sourceFile] of shapes) {
+      const ctx = ctxOf([
+        commit("aaaa111", "/r", [{ file: testFile, added: 20, removed: 0 }, { file: sourceFile, added: 2, removed: 0 }], d18),
+        commit("bbbb222", "/r", [{ file: sourceFile, added: 1, removed: 0 }], d18),
+      ]);
+      const out = clusterRecap([
+        { repo: "app", text: "a", evidence: "aaaa111" },
+        { repo: "app", text: "b", evidence: "bbbb222" },
+      ], ctx);
+      expect(out[0]!.group).toBe(`${sourceFile} — 2 commits (Aug 18)`);
+      expect(out[1]!.group).toBe(out[0]!.group);
+    }
   });
 
   test("different labels never share a cluster; decorated labels cluster with their bare form (norm)", () => {
@@ -179,6 +320,13 @@ describe("render — group-aware nesting", () => {
     const idx = (n: string) => text.indexOf(n);
     expect(idx("#1")).toBeLessThan(idx("#2"));
     expect(idx("#2")).toBeLessThan(idx("#3"));   // stable within zeta
+    // Since 2026-09-24 (S3b) each label is ONE collapsed line, PRs and SHAs in the struct's order,
+    // dates as a chronological range — see test/merge-foot-collapse.test.ts.
+    const lines = text.split("\n");
+    const alpha = lines.indexOf("   • [alpha] 🔀 1 PR merged (#1) (Aug 18)  (aaaa111)");
+    expect(alpha).toBeGreaterThan(-1);
+    expect(lines[alpha + 1]).toBe("   • [zeta] 🔀 2 PRs merged (#2, #3) (Aug 19–Aug 20)  (bbbb222, cccc333)");
+    expect(text).not.toContain("🔀 Merged #");
   });
 });
 
@@ -314,7 +462,7 @@ describe("fix-round pins", () => {
     const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join, resolve } = await import("node:path");
-    const shimDir = mkdtempSync(join(tmpdir(), "git-shim-"));
+    const shimDir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "git-shim-")));
     const realGit = (await Bun.$`which git`.text()).trim();
     writeFileSync(join(shimDir, "git"), `#!/bin/sh
 for a in "$@"; do case "$a" in --diff-merges=*) echo "error: unknown option" >&2; exit 129;; esac; done

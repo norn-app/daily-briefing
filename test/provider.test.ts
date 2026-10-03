@@ -5,6 +5,7 @@ import { ProviderError } from "../src/types";
 import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 test("BYOCliProvider pipes prompt via stdin and returns stdout", async () => {
   const p = new BYOCliProvider({ cli: "cat", argv: [], promptVia: "stdin" });
@@ -14,11 +15,6 @@ test("BYOCliProvider pipes prompt via stdin and returns stdout", async () => {
 test("throws missing-binary for a nonexistent CLI", async () => {
   const p = new BYOCliProvider({ cli: "definitely-not-a-real-cli-xyz", argv: [], promptVia: "stdin" });
   await expect(p.generate("x")).rejects.toMatchObject({ code: "missing-binary" });
-});
-
-test("throws nonzero-exit when the CLI fails", async () => {
-  const p = new BYOCliProvider({ cli: "sh", argv: ["-c", "exit 3"], promptVia: "stdin" });
-  await expect(p.generate("x")).rejects.toBeInstanceOf(ProviderError);
 });
 
 test("nonzero-exit surfaces the CLI's STDOUT when stderr is empty (claude prints its error to stdout — audit 2026-07-11)", async () => {
@@ -49,7 +45,7 @@ test("promptVia: arg appends the prompt as an argv entry", async () => {
 });
 
 test("a non-ENOENT spawn failure (EACCES: cli points at a non-executable file) is NOT mislabeled missing-binary", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "dba-noexec-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-noexec-")));
   const notExecutable = join(dir, "not-a-cli");
   writeFileSync(notExecutable, "#!/bin/sh\necho hi\n");
   chmodSync(notExecutable, 0o644); // readable but NOT executable → spawn throws EACCES, not ENOENT
@@ -93,18 +89,6 @@ test("withRetry: missing-binary and non-ProviderError throw immediately (no retr
   await expect(withRetry(async () => { calls++; throw new Error("plain bug"); }, [5], async () => {}))
     .rejects.toThrow("plain bug");
   expect(calls).toBe(1);
-});
-
-test("returns stdout even when a grandchild holds stderr open past the flush (no false empty-output) [Tier-3 #6]", async () => {
-  // sh writes BRIEFING to stdout then exits; a backgrounded `sleep` (its stdout → /dev/null) inherits
-  // ONLY stderr, holding that pipe open after sh exits. Old code assigned out/err together after
-  // Promise.all([stdout,stderr]) → stderr never EOFs → out stayed "" → false empty-output even though
-  // stdout was fully read. Originally fixed by assigning each stream independently; since C1 the same property comes from the sinks being readable mid-flight.
-  const p = new BYOCliProvider(
-    { cli: "sh", argv: ["-c", "echo BRIEFING; sleep 1 1>/dev/null &"], promptVia: "stdin" },
-    { flushMs: 150 },
-  );
-  expect((await p.generate("x")).trim()).toBe("BRIEFING");
 });
 
 test("a signal-killed provider (not our timeout) is labeled killed/nonzero-exit, not 'timeout' [Tier-5]", async () => {

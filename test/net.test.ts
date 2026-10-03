@@ -78,6 +78,26 @@ test("resolveProbeHosts: a sole port-0 entry is invalid (port 0 can never be a T
   expect(r.warning).toMatch(/all networkProbeHosts entries invalid/i);
 });
 
+test("⚠ resolveProbeHosts: the warning NAMES THE FALLBACK IN EFFECT, not always 'defaults'", () => {
+  // Since A3/T9 the caller supplies a fallback derived from the provider endpoint — and for a LOOPBACK
+  // api endpoint that fallback is `[]`, which DISABLES the gate. Saying "using defaults" there told the
+  // user the two anycast hosts were being probed while the network gate had in fact been turned off:
+  // a diagnostic describing a different system from the one running, which is worse than none.
+  for (const raw of ["garbage", [{ host: 1 }]] as unknown[]) {
+    const off = resolveProbeHosts(raw, []);
+    expect(off.hosts).toEqual([]);
+    expect(off.warning).toMatch(/DISABLED/);
+    expect(off.warning).not.toMatch(/using defaults/);
+
+    const derived = resolveProbeHosts(raw, [{ host: "gw.corp.test", port: 8443 }]);
+    expect(derived.hosts).toEqual([{ host: "gw.corp.test", port: 8443 }]);
+    expect(derived.warning).toContain("gw.corp.test:8443");
+    expect(derived.warning).not.toMatch(/using defaults/);
+  }
+  // …and with no fallback supplied at all, the legacy wording is unchanged for every CLI user.
+  expect(resolveProbeHosts("garbage").warning).toMatch(/using defaults/);
+});
+
 test("resolveProbeHosts: some valid, some invalid → keeps the valid ones + 'ignored' warning", () => {
   const r = resolveProbeHosts([{ host: "1.1.1.1", port: 443 }, null]);
   expect(r.hosts).toEqual([{ host: "1.1.1.1", port: 443 }]);

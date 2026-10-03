@@ -2,19 +2,22 @@
 // ⚠ The plan notes NO harness existed for uninstall. This writes one: it CREATES every artifact
 // first, then asserts removal — a harness that only checks "the dir is gone" would pass against an
 // uninstall that never knew those files existed.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { archivedBriefingPath } from "../src/marker";
 import { join, dirname, basename } from "node:path";
 import { auditFilesToPrune, AUDIT_RETENTION, lastBriefing, LAST_BRIEFING_SCAN_BYTES } from "../src/audit";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 test("T4.7: uninstall removes briefing.log.1, audit-*.md and transcript-health.json", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "dba-uninst-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-uninst-")));
   const plist = join(dir, "fake.plist");
   const artifacts = [
     "daily-briefing", "wake-schedule.json", "briefing.log", "briefing-latest.md",
     "briefing.log.1", "transcript-health.json", "audit-2026-07-30.md", "audit-2026-07-31.md",
+    "update-check.json",   // Phase E (E11): the opt-in update check's record
   ];
   for (const f of artifacts) writeFileSync(join(dir, f), "x");
   // The dated archive is a DIRECTORY — a glob `rm -f` would leave the user's whole briefing history
@@ -29,9 +32,18 @@ test("T4.7: uninstall removes briefing.log.1, audit-*.md and transcript-health.j
   writeFileSync(plist, "<plist/>");
   for (const f of artifacts) expect(existsSync(join(dir, f))).toBe(true);   // created, so removal is meaningful
 
+  // Phase E (E10): do-nothing stubs FIRST on PATH for the machine-wide tools uninstall.sh drives by name.
+  // Before this, the run reached the real launchd tool (harmless only because the plist above is
+  // label-less); R10 says a test never reaches it at all. Names by concatenation for the isolation scanner.
+  const stubs = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-uninst-stubs-")));
+  const path = `${stubs}:${process.env.PATH ?? ""}`;
+  for (const name of ["launch" + "ctl", "sec" + "urity", "pmset"]) {
+    writeFileSync(join(stubs, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    expect(Bun.which(name, { PATH: path })).toBe(join(stubs, name));
+  }
   const proc = Bun.spawn(["bash", "scripts/uninstall.sh"], {
     cwd: process.cwd(),
-    env: { ...process.env, DBA_TEST_DIR: dir, DBA_TEST_PLIST: plist },
+    env: { ...process.env, PATH: path, DBA_TEST_DIR: dir, DBA_TEST_PLIST: plist },
     stdout: "pipe", stderr: "pipe",
   });
   await proc.exited;

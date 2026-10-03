@@ -9,12 +9,16 @@
 // 7-char prefix, exactly-once coverage) for a deterministic pass/fail on synthetic fixtures. The two
 // share vocabulary, not semantics — a shared primitive would force one to adopt the other's and regress it.
 import type { Activity } from "./types";
-import { repoLabelFor, INFRA_DENYLIST, type Unit } from "./subprojects";
+import { repoLabelFor, INFRA_DENYLIST, LEGEND_PREFIX, NOT_SHOWN_PREFIX, VERDICT_MARKER_PREFIX, labelBoundary, type Unit } from "./subprojects";
 // The SAME shape test the generator's grounding guard uses (src/sha.ts) — so a hex-ish prose word the
 // generator legitimately KEEPS in evidence ("added"/"cafe") isn't re-mined here and re-flagged as a
 // `fabricated SHA` in the deterministic report + the EVAL row (final-review Tier-D).
 import { isShaShaped } from "./sha";
+// featuresLine's verdict-path echo reads the key through the ENGINE's own resolver, so the report says
+// "on" exactly when runCore marks. config.ts is already in this module's graph (via ./subprojects).
+import { resolveVerdictPaths } from "./config";
 import { localDateStr } from "./marker";
+import { redactCredentials } from "./transcripts/credentials";
 
 // Parse the briefing's "state as of HH:MM" stamp (core.ts stateAsOf = local HH:MM, rendered by
 // render.ts) into the generation INSTANT on bDate (local epoch-ms), or null if absent/unparseable.
@@ -251,12 +255,46 @@ export function coverageGaps(
   reposWithState: { repo: string; labels: string[] }[],
   briefingText: string,
 ): { repo: string; labels: string[] }[] {
-  const hay = briefingText.toLowerCase();
+  // ⚠ THE SUB-PROJECT LEGEND LINE IS EXCLUDED FROM THE HAYSTACK, AND THIS IS AN EVAL-FLAG GUARD, not
+  // a formatting nicety. That line (render.ts) exists to TELL the reader which labels are areas of
+  // which repo, so by construction it names every sub-project label AND its parent repo label. Left
+  // in the haystack it answers this function's question — "did the briefing name this repo?" — for
+  // free, every morning, for any repo with ≥1 sub-project unit. MEASURED on a probe struct: 1 gap
+  // before the legend existed, 0 after. `UNCOMMITTED NOT SURFACED` (EVAL days 16, 25) would have
+  // stopped firing and the EVAL row would have read cleaner while the briefing got no better.
+  //
+  // ⚠ A LINE FILTER ON THE RENDERED TEXT, NOT A STRUCT-LEVEL EXCLUSION, because this function audits
+  // SAVED briefings from previous days — `scripts/audit.ts` reads `briefing.log`, where no struct
+  // survives. Text is the only input it will ever have.
+  //
+  // ⚠ SCOPED TO THE LEGEND ONLY. Excluding all code-built scaffolding (merge lines, the outage
+  // notice) would CREATE gaps that do not fire today — the same eval-metric change in the other
+  // direction, and equally the operator's decision, not a refactor's. `missingSameDay` above is
+  // deliberately untouched: it matches 7-char SHA prefixes, and the legend carries no SHAs.
+  //
+  // Prefix constant is SHARED with the writer (subprojects.ts `LEGEND_PREFIX`): two literals would
+  // let one side be re-worded while the other silently stopped matching, which is precisely the
+  // failure this guard exists to prevent.
+  const hay = briefingText
+    .split("\n")
+    // NOT_SHOWN_PREFIX joins the legend for the identical reason (user-directed 2026-09-03): the
+    // recap-coverage drop lines name a lane only to report that one of its commits was OMITTED, so
+    // leaving them in would let an omission report stand in for surfacing working state.
+    // VERDICT_MARKER_PREFIX joins them (IN-2, user-directed by the completion-build design appendix
+    // and conditioned on by EVAL.md's 2026-09-17 comparability boundary): the marker is an annotation
+    // UNDER a suggestion, and the suggestion line itself stays in the haystack — only the added line
+    // is excluded, so no flag can move because the marker was switched on. See the constant's header.
+    .filter((l) => !l.startsWith(LEGEND_PREFIX) && !l.startsWith(NOT_SHOWN_PREFIX) && !l.startsWith(VERDICT_MARKER_PREFIX))
+    .join("\n")
+    .toLowerCase();
   return reposWithState.filter(({ labels }) =>
-    !labels.some((l) => {
-      const esc = l.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      return new RegExp(`\\b${esc}\\b`).test(hay);
-    }),
+    // Boundary rule shared with `checkSuggestionVolume` — see `labelBoundary` for the full reasoning.
+    // It replaced a local `\b` form on 2026-08-30 (user-directed). `\b` was wrong in BOTH directions
+    // on this flag: at a punctuation edge it inverts, so `/\bc\+\+\b/` misses "touch c++ bindings"
+    // (inventing a gap) and matches "c++abc" (suppressing a real one); and being ASCII-word-based
+    // even under /u, it fires inside non-Latin text. Measured zero behavioural change for this
+    // deployment's real labels — 0 differing pairs over 9 labels x 1397 real briefing lines.
+    !labels.some((l) => labelBoundary(l.toLowerCase()).test(hay)),
   );
 }
 
@@ -445,7 +483,18 @@ recomputed; the recap must be consistent with this and must not claim anything a
 Per-commit file lists come from \`git log --numstat\`; MERGE commits list no files, so an absent file
 list does NOT prove a commit changed nothing. Working-tree facts here reflect NOW, and repos change
 between the briefing's generation and this audit (the vault auto-commits every ~10 min) — prefer the
-briefing's own "state as of HH:MM" stamp and drift warnings over calling a mismatch fabrication:
+briefing's own "state as of HH:MM" stamp and drift warnings over calling a mismatch fabrication.
+REF REACHABILITY likewise reflects NOW: branches move, and this repo lands PRs by SQUASH-merge then
+deletes the branch, which legitimately orphans that branch's working commits AFTER the briefing
+correctly described them. A commit reachable from no ref may therefore be ordinary post-merge
+cleanup, not loss. Decide from the "squash-landed PR-shaped commit(s)" list below — the evidence in
+THIS prompt: if a squash-landed commit's subject plausibly covers the same lane of work, report
+post-merge cleanup; report LOSS only when NO squash-landed commit could carry it, and when unsure
+say so rather than choosing. (You see squash SUBJECTS only, not bodies — do not claim to have
+checked a commit's body.) And never infer a PR's nonexistence from the "PR merge(s)" heading alone —
+that heading counts only TRUE merge commits. Squash landings are single-parent commits: the
+PRE-generation ones appear in the COMMIT lists, while POST-generation ones appear ONLY in the
+squash-landed list (tagged "landed AFTER generation") and the post-generation note:
 ${parts.gitFacts}
 
 DETERMINISTIC CHECKS already run in code (treat as verified fact; build on them, don't re-derive):
@@ -803,7 +852,9 @@ export function unknownFailureLine(repos: string[]): string | null {
  *  "re-run" nor "fix that config entry" — nothing about the repo list is wrong. */
 export function gitUnavailableLine(detail: string): string | null {
   if (!detail.trim()) return null;
-  return `GIT UNAVAILABLE: could not start git (${detail.trim().slice(0, 160)}) — no repo could be checked. This audit verified nothing.`;
+  // Redact, THEN clip (the report is redacted again as a whole, but a credential cut at 160 chars can
+  // keep a prefix too short for any pattern to match there).
+  return `GIT UNAVAILABLE: could not start git (${redactCredentials(detail.trim()).slice(0, 160)}) — no repo could be checked. This audit verified nothing.`;
 }
 
 /** Repos git could definitively NOT read (a nonzero exit, not a truncated one): a deleted path left in
@@ -834,7 +885,7 @@ export function unreadableReposLine(repos: string[]): string | null {
  *  trace was a stderr line that never reaches the saved `audit-<date>.md`, so on a scheduled run it was
  *  invisible. A degraded audit outscoring a healthy one is the exact defect this file keeps closing. */
 export function groundTruthUnavailableLine(err: unknown): string {
-  return `GROUND TRUTH UNAVAILABLE: the same-day and uncommitted-coverage checks did NOT run (${String(err).slice(0, 200)}) — this audit is INCOMPLETE and its "no same-day miss" silence means nothing. Do not record a row from it.`;
+  return `GROUND TRUTH UNAVAILABLE: the same-day and uncommitted-coverage checks did NOT run (${redactCredentials(String(err)).slice(0, 200)}) — this audit is INCOMPLETE and its "no same-day miss" silence means nothing. Do not record a row from it.`;
 }
 
 /** The SHA-grounding verdict, which must never be confident about repos it could not read (F2 review).
@@ -940,6 +991,7 @@ export function featuresLine(cfg: {
   transcripts?: { enabled?: boolean; root?: string };
   subprojects?: { repo: string; roots: string[] }[];
   provider: { harden?: boolean; timeoutMs?: number };
+  verdictPaths?: unknown;
 }, resolvedTranscripts: { enabled: boolean; root: string }): string {
   const tx = resolvedTranscripts.enabled ? `on (root=${resolvedTranscripts.root})` : "OFF";
   const sub = cfg.subprojects?.length
@@ -947,7 +999,16 @@ export function featuresLine(cfg: {
     : "OFF (single-unit repos)";
   const harden = cfg.provider.harden === false ? "OFF" : "on";
   const timeout = `${(cfg.provider.timeoutMs ?? 120000) / 1000}s`;
-  return `features (deployed config): transcripts=${tx} · subprojects=${sub} · harden=${harden} · provider timeout=${timeout}`;
+  // IN-2 (cold review, lens 2 MED): without this, a key-on day with zero marks and a key-off day read
+  // identically, and an EVAL watch could be opened on a switched-off marker — the day-29/32 failure
+  // above. The resolved PATHS are printed, not a count: a repo-name-prefixed entry
+  // (`personal_code/quant_stocks`) is accepted by the resolver and never matches, and this page is
+  // where that becomes visible. A report line only — not in `deterministic`, so no flag counts it,
+  // and not briefing text, so `coverageGaps`' haystack never sees it.
+  const vp = resolveVerdictPaths(cfg.verdictPaths);
+  const verdict = vp.warning ? "OFF (malformed — marker disabled)"
+    : vp.paths.length ? `on (${vp.paths.join(", ")})` : "OFF";
+  return `features (deployed config): transcripts=${tx} · subprojects=${sub} · harden=${harden} · provider timeout=${timeout} · verdictPaths=${verdict}`;
 }
 
 export function auditMayCarryRawTurn(provider: { cli: string; harden?: boolean }, claudeShapedFn: (cli: string) => boolean): boolean {

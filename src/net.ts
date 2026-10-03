@@ -12,10 +12,31 @@ type ProbeHost = { host: string; port: number };
 // (wrong shape, out-of-range port, forgot the array brackets) must not crash the network gate or
 // silently settle it into permanent non-delivery — fall back to the defaults and surface a warning
 // instead, so the run still completes and the misconfiguration is visible in the briefing.
-export function resolveProbeHosts(raw: unknown): { hosts: ProbeHost[]; warning?: string } {
-  if (raw === undefined) return { hosts: DEFAULT_NETWORK_PROBE_HOSTS };
+// `fallback` (A3/T9, ADDITIVE with a default that preserves today's behaviour EXACTLY): what to probe
+// when the config says nothing. The caller derives it — for an API provider, the endpoint the run will
+// actually talk to, or `[]` for a local model — because this module stays provider-agnostic per the
+// header above. An EXPLICIT config value always wins, `[]` included; `raw === undefined` on the first
+// line is the only place the fallback is consulted, and that is pinned by a test.
+/** Name the fallback ACTUALLY IN EFFECT, not "defaults". Since A3/T9 the caller can supply an
+ *  endpoint-derived list — and for a loopback api endpoint that list is `[]`, which DISABLES the gate.
+ *  A warning that said "using defaults" there told the user the two anycast hosts were being probed
+ *  while the network gate had in fact been turned off. Diagnostic-only; the behaviour is the intended
+ *  one either way, but a diagnostic that describes a different system than the one running is worse
+ *  than none. */
+function fallbackPhrase(fallback: ProbeHost[]): string {
+  if (fallback.length === 0) return "the network gate is DISABLED (no fallback hosts — a loopback provider endpoint needs no connectivity check)";
+  const sameAsDefault = fallback === DEFAULT_NETWORK_PROBE_HOSTS;
+  return sameAsDefault
+    ? "using defaults"
+    : `falling back to the provider endpoint (${fallback.map((h) => `${h.host}:${h.port}`).join(", ")})`;
+}
+
+export function resolveProbeHosts(
+  raw: unknown, fallback: ProbeHost[] = DEFAULT_NETWORK_PROBE_HOSTS,
+): { hosts: ProbeHost[]; warning?: string } {
+  if (raw === undefined) return { hosts: fallback };
   if (!Array.isArray(raw)) {
-    return { hosts: DEFAULT_NETWORK_PROBE_HOSTS, warning: "networkProbeHosts must be an array of {host,port}; using defaults" };
+    return { hosts: fallback, warning: `networkProbeHosts must be an array of {host,port}; ${fallbackPhrase(fallback)}` };
   }
   if (raw.length === 0) return { hosts: [] }; // explicit skip switch (§5) — preserved, no warning
   const valid = raw.filter(
@@ -24,7 +45,7 @@ export function resolveProbeHosts(raw: unknown): { hosts: ProbeHost[]; warning?:
       Number.isInteger((h as ProbeHost).port) && (h as ProbeHost).port >= 1 && (h as ProbeHost).port <= 65535,
   );
   if (valid.length === 0) {
-    return { hosts: DEFAULT_NETWORK_PROBE_HOSTS, warning: "all networkProbeHosts entries invalid; using defaults" };
+    return { hosts: fallback, warning: `all networkProbeHosts entries invalid; ${fallbackPhrase(fallback)}` };
   }
   return { hosts: valid, warning: valid.length < raw.length ? "some networkProbeHosts entries were invalid and ignored" : undefined };
 }

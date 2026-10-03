@@ -18,11 +18,13 @@
 // And `--tools`/`--settings` make `init` exit NON-ZERO — never a tick, never `--force`. A `--settings`
 // SessionStart hook was measured EXECUTING under full hardening, i.e. arbitrary shell execution, so it is
 // worth refusing to proceed while the user is present to fix it. It is never worth killing a morning over.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hardenedProvider, assertInitSafeArgv, argvConflicts } from "../src/harden";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const fast = { probeMs: 3_000, flushMs: 150 };
 
@@ -36,7 +38,7 @@ echo "ARGV:[$*]"
 }
 
 test("B7: a user's own --tools SKIPS our injection and warns — theirs would win anyway", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-b7-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b7-")));
   const cli = await fakeClaude(dir);
   const hp = hardenedProvider({ cli, argv: ["--tools", "Bash"], promptVia: "stdin" },
     { ...fast, stateDir: join(dir, "state") });
@@ -52,7 +54,7 @@ test("B7: a user's own --tools SKIPS our injection and warns — theirs would wi
 test("B7: a user's own --setting-sources SKIPS ours — and the cwd narrowing follows it", async () => {
   // The gate's reasoning applies transitively: if we could not impose the isolation flag, the narrow cwd
   // is unjustified for exactly the same reason it is unjustified when the probe did not find it.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b7b-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b7b-")));
   const cli = await fakeClaude(dir);
   const hp = hardenedProvider({ cli, argv: ["--setting-sources", "project,user"], promptVia: "stdin" },
     { ...fast, stateDir: join(dir, "state") });
@@ -64,7 +66,7 @@ test("B7: a user's own --setting-sources SKIPS ours — and the cwd narrowing fo
 });
 
 test("B7: an ADJACENT flag warns but does NOT disable anything — hardening still holds", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-b7c-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b7c-")));
   const cli = await fakeClaude(dir);
   const hp = hardenedProvider({ cli, argv: ["--dangerously-skip-permissions"], promptVia: "stdin" },
     { ...fast, stateDir: join(dir, "state") });
@@ -78,7 +80,7 @@ test("B7: the scan reads the CONFIG argv, never the final argv with the prompt i
   // In arg-mode the prompt is a positional token built from commit subjects — attacker-influenceable
   // text. A prompt that happens to contain "--settings" must never be read as a config conflict, or an
   // attacker could steer a security decision by naming a flag in a branch name.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b7d-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b7d-")));
   const cli = await fakeClaude(dir);
   const hp = hardenedProvider({ cli, argv: [], promptVia: "arg" }, { ...fast, stateDir: join(dir, "state") });
   await hp.generate("fix --settings and --tools handling in the parser");
@@ -108,7 +110,7 @@ test("B7: assertInitSafeArgv accepts adjacent flags — only those two are refus
 test("B7: a tick NEVER hard-errors on a conflicting argv — it warns and delivers", async () => {
   // The asymmetry that matters. Refusing to WRITE a dangerous config is cheap; refusing to RUN one means
   // no briefing tomorrow, and the user cannot act on a briefing they never received.
-  const dir = await mkdtemp(join(tmpdir(), "dba-b7e-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-b7e-")));
   const cli = await fakeClaude(dir);
   const hp = hardenedProvider({ cli, argv: ["--settings", "./s.json"], promptVia: "stdin" },
     { ...fast, stateDir: join(dir, "state") });
@@ -126,7 +128,7 @@ test("B7: a tick NEVER hard-errors on a conflicting argv — it warns and delive
  *  could eat the 5s test timeout. The XDG isolation is kept as a belt in case any other path reaches
  *  configPath(); it is the same save/set/restore used in config.test.ts, main.test.ts, integration.test.ts. */
 async function withIsolatedConfigHome<T>(fn: () => Promise<T>): Promise<T> {
-  const home = await mkdtemp(join(tmpdir(), "dba-xdg-"));
+  const home = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-xdg-")));
   const prev = process.env.XDG_CONFIG_HOME;
   process.env.XDG_CONFIG_HOME = home;
   try { return await fn(); }

@@ -1,13 +1,15 @@
+import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 // Slice 1.5 M8 — the output-side scan (T8.1), the audit's content-search ground truth (T8.1a),
 // sink-6 suppression with its downgrade record (T8.2), and invariant 5 on path 1 (T8.3).
 import { test, expect } from "bun:test";
 import { redactCredentials, matchesCredential, ingestScan, REDACTION } from "../src/transcripts/credentials";
 import { quotationsIn, groundTruthForQuotations, auditMayCarryRawTurn, HARDENING_OFF_NOTICE, buildAuditPrompt } from "../src/audit";
-import { parseWhy, renderWhy } from "../src/transcripts/frame";
+import { parseWhy } from "../src/transcripts/frame";
 import { textSha } from "../src/transcripts/anchor";
 import { claudeShaped } from "../src/harden";
 import { renderBriefing } from "../src/render";
 import type { BriefingStruct } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const base: BriefingStruct = {
   date: "2026-07-30", machineScope: "m", provider: "claude",
@@ -62,12 +64,16 @@ test("T8.1 CALL SITE, sinks 1-3: the REAL run() path redacts what reaches stdout
   // A credential-shaped BRANCH name — git-derived text, which is exactly what the output scan is for.
   await branchCommit(repo, "ghp_abcdefghijklmnopqrstuvwxyz0123456789", "b.ts", iso());
 
-  const cfgHome = mkdtempSync(join(tmpdir(), "dba-s-cfg-"));
-  const stateDir = mkdtempSync(join(tmpdir(), "dba-s-state-"));
+  const cfgHome = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-s-cfg-")));
+  const stateDir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-s-state-")));
+  // `root` keeps the scan hermetic: with transcripts enabled and no root, run() resolves the default
+  // `~/.claude/projects` and reads the developer's REAL transcripts from inside a unit test (measured:
+  // 2.2 s here, 0.3 s against an empty dir). The scan still runs — only its corpus is empty.
+  const txRoot = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-s-tx-")));
   mkdirSync(join(cfgHome, "daily-briefing"), { recursive: true });
   writeFileSync(join(cfgHome, "daily-briefing", "config.json"), JSON.stringify({
     repos: [repo], excludeCommitPatterns: [], lookbackCapDays: 30,
-    transcripts: { enabled: true }, provider: { cli: "claude", argv: [], promptVia: "stdin" },
+    transcripts: { enabled: true, root: txRoot }, provider: { cli: "claude", argv: [], promptVia: "stdin" },
   }));
   const prevXdg = process.env.XDG_CONFIG_HOME, prevState = process.env.DAILY_BRIEFING_STATE_DIR;
   process.env.XDG_CONFIG_HOME = cfgHome;
@@ -93,10 +99,9 @@ test("T8.1 CALL SITE, sinks 1-3: the REAL run() path redacts what reaches stdout
   expect(stdout).toContain(REDACTION);
   // Sink 2: the persisted copy the user and the audit both read.
   const latest = join(stateDir, "briefing-latest.md");
-  if (existsSync(latest)) {
-    const saved = readFileSync(latest, "utf-8");
-    expect(saved).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
-  }
+  expect(existsSync(latest)).toBe(true);   // the sink must exist for the check below to mean anything
+  const saved = readFileSync(latest, "utf-8");
+  expect(saved).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
 });
 
 test("T8.1: a git-only briefing whose BRANCH NAME looks credential-shaped is still redacted at the sink", () => {

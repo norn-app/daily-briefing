@@ -2,15 +2,28 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeAtRunEnd } from "./temp-dirs";
+
+/** Fixture git runs under a NEUTRAL config (round-4 harden D4-L1) — the project's existing pattern
+ *  (fixtures/eval-repo.ts, git.default-ref-merges.test.ts). Without it the developer's GLOBAL/SYSTEM
+ *  gitconfig shaped what these fixtures build — measured with a global file in a disposable copy: a
+ *  global `commit.gpgsign=true` made fixture commits call the developer's REAL signer (core.test.ts
+ *  alone, 4 calls before its first failure), and for git.show-signature.test.ts's signed fixture a global
+ *  `gpg.format` picked the signer (`ssh`: red, ssh-keygen handed a gpg key id; `x509`: the global x509
+ *  program called) unless that file's own `gpg.format` line also guards it.
+ *  Nothing here needs a global value: identity is set per repo (`buildRepo`'s `user.name`/`user.email`;
+ *  a hand-init'd repo handed to `commitFiles` sets its own) and per commit (the GIT_*_EMAIL env below).
+ *  Test-local commit helpers elsewhere in test/ still inherit the global config — not this fixture's job. */
+const GIT_ISOLATION_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 
 async function git(args: string[], cwd: string, env: Record<string,string> = {}) {
-  const p = Bun.spawn(["git", ...args], { cwd, env: { ...process.env, ...env } as any, stdout: "pipe", stderr: "pipe" });
+  const p = Bun.spawn(["git", ...args], { cwd, env: { ...process.env, ...GIT_ISOLATION_ENV, ...env } as any, stdout: "pipe", stderr: "pipe" });
   await p.exited;
   if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(p.stderr).text()}`);
 }
 
 async function gitOut(args: string[], cwd: string, env: Record<string,string> = {}): Promise<string> {
-  const p = Bun.spawn(["git", ...args], { cwd, env: { ...process.env, ...env } as any, stdout: "pipe", stderr: "pipe" });
+  const p = Bun.spawn(["git", ...args], { cwd, env: { ...process.env, ...GIT_ISOLATION_ENV, ...env } as any, stdout: "pipe", stderr: "pipe" });
   const out = await new Response(p.stdout).text();
   await p.exited;
   if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${await new Response(p.stderr).text()}`);
@@ -19,7 +32,7 @@ async function gitOut(args: string[], cwd: string, env: Record<string,string> = 
 
 /** commits: [{ file, content, isoDate, email }] committed in order at the given committer+author date. */
 export async function buildRepo(commits: { file: string; content: string; isoDate: string; email?: string }[]): Promise<string> {
-  const dir = mkdtempSync(join(tmpdir(), "dba-repo-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-repo-"))); // before `git init`, so a repo that fails mid-build is still removed
   await git(["init", "-q", "-b", "main"], dir);
   await git(["config", "user.name", "Test"], dir);
   await git(["config", "user.email", "test@example.com"], dir);

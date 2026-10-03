@@ -10,8 +10,9 @@ import {
   humanTurn, harnessTurn, textBlockTurn, documentTurn, assistantToolUse, unrecognisedLine,
   buildSession, buildRawSession, buildProjectTree, windowsToolUseSession, WINDOWS_PATHS,
 } from "./fixtures/session";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
-const tmp = () => mkdtempSync(join(tmpdir(), "dba-sess-"));
+const tmp = () => removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-sess-")));
 const read = (p: string) => readFileSync(p, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
 const base = { sessionId: "s1", ts: "2026-07-30T10:00:00.000Z" };
 

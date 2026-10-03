@@ -2,6 +2,7 @@
 // Validation lives at the USE site (resolveAccounts), matching resolveTranscripts, so that a malformed
 // optional block degrades to "off, with a warning" instead of throwing — a throw from config loading
 // costs the briefing on every 600s tick.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";

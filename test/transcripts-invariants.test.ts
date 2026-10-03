@@ -1,26 +1,27 @@
-// Slice 1.5 T4.5 — invariants 3, 4, 6 and 8, plus the INGEST half of 7.
+// Slice 1.5 T4.5 — invariants 3, 4, 6 and 8 (7's INGEST half is pinned in transcripts-transform.test.ts).
 // Slice 1.5 T4.6 — the prompt-equality test.
 //
 // Each goes RED when its guard is removed; where a guard is structural rather than a line of code,
 // the test says which structure it depends on, so a later refactor that dissolves that structure
 // fails here rather than silently voiding the invariant.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCore } from "../src/core";
 import { scanTranscripts, emptyEvidence } from "../src/transcripts/scan";
 import { textSha } from "../src/transcripts/anchor";
 import { transformLines } from "../src/transcripts/transform";
-import { ingestScan } from "../src/transcripts/credentials";
 import { readJsonl, emptyTally } from "../src/transcripts/reader";
 import { buildRepo } from "./fixtures/build-repo";
 import { buildSession, buildRawSession, humanTurn, assistantToolUse, unrecognisedLine } from "./fixtures/session";
 import type { Config } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const yesterdayNoon = () => { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - 1); return d.toISOString(); };
 const stub = { generate: async () => "## RESUME\n- [x] r\n## RECAP\n- [x] d | evidence: HEADSHA\n## SUGGESTIONS\n- n" };
-const tmp = () => mkdtempSync(join(tmpdir(), "dba-inv-"));
+const tmp = () => removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-inv-")));
 const W = { startUtc: "2026-07-29T00:00:00.000Z", endUtc: "2026-07-31T00:00:00.000Z" };
 const CFG: Config = { provider: { cli: "claude", argv: [], promptVia: "stdin" } };
 
@@ -111,15 +112,6 @@ test("inv6: unrecognised line type, block type, tool name and malformed JSON are
   expect(drops["unrecognised-shape"]).toBe(2);      // the two unknown LINE types
   expect(out.paths).toEqual([]);                    // unknown TOOL name yields nothing — allowlist, not denylist
   expect(out.turns).toEqual([]);                    // unknown BLOCK type yields nothing
-});
-
-// ── Invariant 7, INGEST half: credential-scanned fail-closed ────────────────────────────────────
-test("inv7-ingest: a credential-bearing turn is DROPPED at ingest, not redacted", async () => {
-  const dirty = "re-run with AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCY to reproduce";
-  expect(ingestScan(dirty)).toEqual({ ok: false, reason: "credential-hit" });
-  // ⚠ Under quotation a redacted span would ship as `you wrote: "…[redacted]"` — advertising a
-  // secret's existence and location while adding nothing. Dropping is both safer and more useful.
-  expect(ingestScan("an ordinary turn about the join logic")).toEqual({ ok: true });
 });
 
 // ── Invariant 8: never breaks, blocks, or delays the git briefing ───────────────────────────────

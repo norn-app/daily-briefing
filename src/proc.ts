@@ -100,6 +100,14 @@ export async function run(cmd: string[], opts?: RunOpts): Promise<RunResult> {
       stdin: opts?.input !== undefined ? "pipe" : undefined,
       stdout: "pipe",
       stderr: "pipe",
+      // The CURRENT environment, passed explicitly. With no `env`, Bun gives the child its STARTUP
+      // environment. Measured on bun 1.3.14: a variable set or deleted on process.env at runtime does
+      // not reach such a child, and a `.env`-loaded one reaches it either way. Nothing in src/ or
+      // scripts/ writes process.env, so in production this is the same set of variables. Under test it
+      // is what carries the isolation fixture's armed DAILY_BRIEFING_STATE_DIR and XDG_CONFIG_HOME into
+      // a child, e.g. scripts/audit.ts's `bun run src/main.ts run --force` regeneration. Pinned by
+      // test/proc.env.test.ts. isolation.meta.test.ts's scanner 6 relies on it when it judges `run(`.
+      env: { ...process.env },
       // Bounded like runGit, for the same reason and against the same repos. Without `timeout` the
       // flush race bounds only the POST-EXIT read, so a child that never exits hangs exactly as the
       // original bug did. `killSignal` must be SIGKILL, not Bun's default SIGTERM: a wedged child that

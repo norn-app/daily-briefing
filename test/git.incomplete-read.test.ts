@@ -13,8 +13,10 @@
 // port silently returns "" as success — a fabricated quiet day that stamps the day. That is worse
 // than the hang, which at least fails visibly.
 import { test, expect, spyOn } from "bun:test";
-import { runGit, IncompleteReadError } from "../src/git";
+import { join } from "node:path";
+import { runGit, IncompleteReadError, GIT_FLUSH_MS, GIT_TIMEOUT_MS } from "../src/git";
 import { buildRepo } from "./fixtures/build-repo";
+import { fastGitFlush } from "./fixtures/git-flush";   // held-pipe tests only — see the fixture header
 
 /** A stream that emits `chunks` then NEVER closes — models a grandchild holding the inherited pipe. */
 function neverEofStream(chunks: string[]): ReadableStream<Uint8Array> {
@@ -59,13 +61,27 @@ async function bounded<T>(p: Promise<T>, ms = 5_000): Promise<T> {
   } finally { if (guardTimer) clearTimeout(guardTimer); }
 }
 
+test("the production flush window is neither 0 nor enormous (the held-pipe tests below override it)", () => {
+  // The fully-faked held-pipe tests here shorten the window via fastGitFlush(), so this file no longer
+  // runs the DEFAULT against a held pipe. (The mixed tests in extractor.incomplete-read still do, and
+  // bound it from above too — but only through bun's 5 s timeout.) Too large and every runGit on a
+  // machine with a held pipe (~110 per tick at 10 repos) burns the window; too small and a healthy
+  // child's EOF reads as a held pipe once the event loop stalls — measured in review 2026-09-24, a
+  // 100 ms window gave real git false "held pipe" results under load (test/fixtures/git-flush.ts), so
+  // the floor sits well above that. Same shape as proc.incomplete-read's DEFAULT_FLUSH_MS pin.
+  expect(GIT_FLUSH_MS).toBeGreaterThanOrEqual(250);
+  expect(GIT_FLUSH_MS).toBeLessThanOrEqual(2_000);
+  expect(GIT_FLUSH_MS).toBeLessThan(GIT_TIMEOUT_MS);
+});
+
 test("runGit THROWS IncompleteReadError when the child exits 0 but stdout never EOFs (grandchild holds the pipe)", async () => {
   const spy = spyOn(Bun, "spawn").mockImplementation(() =>
     fakeSpawn({ stdout: neverEofStream(["abc1234 a real commit subject\n"]), stderr: eofStream([]) }));
+  const flush = fastGitFlush();   // the held fake never EOFs, so the window is pure wait
   try {
     // Must FAIL CLOSED. Returning the partial — or worse, "" — would be a fabricated quiet day.
     await expect(bounded(runGit(["log"], "/tmp"))).rejects.toBeInstanceOf(IncompleteReadError);
-  } finally { spy.mockRestore(); }
+  } finally { flush.restore(); spy.mockRestore(); }
 });
 
 test("runGit returns \"\" as SUCCESS for a genuinely empty result (clean tree) — the discriminator", async () => {
@@ -73,14 +89,6 @@ test("runGit returns \"\" as SUCCESS for a genuinely empty result (clean tree) �
     fakeSpawn({ stdout: eofStream([]), stderr: eofStream([]) }));   // EOF'd, just empty
   try {
     expect(await runGit(["status", "--porcelain"], "/tmp")).toBe("");
-  } finally { spy.mockRestore(); }
-});
-
-test("runGit succeeds when only STDERR is held and stdout completed (gate on stdout only)", async () => {
-  const spy = spyOn(Bun, "spawn").mockImplementation(() =>
-    fakeSpawn({ stdout: eofStream(["on branch main\n"]), stderr: neverEofStream(["warning: noise\n"]) }));
-  try {
-    expect(await bounded(runGit(["status"], "/tmp"))).toBe("on branch main\n");
   } finally { spy.mockRestore(); }
 });
 
@@ -130,18 +138,6 @@ function erroringStream(chunks: string[], delayMs: number): ReadableStream<Uint8
   });
 }
 
-test("a stream that ERRORS instead of EOF-ing is an IncompleteReadError, not a raw error", async () => {
-  // The read is incomplete either way, so it must reach the SAME fail-closed routing. Leaking the
-  // raw error instead means every `orElse` site swallows it (gitDirExists → false, resolveAuthor →
-  // "" = NO AUTHOR FILTER) and extractor's inner catch routes it down the unborn-HEAD/classify path
-  // to a `not-a-repo` issue — which is NOT isInaccessible, so the run stamps a fabricated quiet day.
-  const spy = spyOn(Bun, "spawn").mockImplementation(() =>
-    fakeSpawn({ stdout: erroringStream(["partial output"], 0), stderr: eofStream([]) }));
-  try {
-    await expect(bounded(runGit(["log"], "/tmp"))).rejects.toBeInstanceOf(IncompleteReadError);
-  } finally { spy.mockRestore(); }
-});
-
 test("a read error BEFORE `exited` resolves is caught, not an unhandled rejection", async () => {
   // `drain` starts the reads at once but the first handler is attached only after `await p.exited`.
   // A read that rejects inside that window left `done` rejected with nobody listening — an unhandled
@@ -156,7 +152,12 @@ test("a read error BEFORE `exited` resolves is caught, not an unhandled rejectio
   } finally { spy.mockRestore(); }
 });
 
-test("the IncompleteReadError names the underlying cause when the read errored", async () => {
+test("a stream that ERRORS instead of EOF-ing is an IncompleteReadError that names the underlying cause", async () => {
+  // The read is incomplete either way, so it must reach the SAME fail-closed routing. Leaking the
+  // raw error instead means every `orElse` site swallows it (gitDirExists → false, resolveAuthor →
+  // "" = NO AUTHOR FILTER) and extractor's inner catch routes it down the unborn-HEAD/classify path
+  // to a `not-a-repo` issue — which is NOT isInaccessible, so the run stamps a fabricated quiet day.
+  //
   // Diagnosis honesty, the same standard that gave gitAvailable three outcomes instead of two: the
   // fix for "a hook is holding the pipe" is not the fix for "the pipe broke", so the message must
   // not assert the former when it observed the latter.
@@ -165,6 +166,7 @@ test("the IncompleteReadError names the underlying cause when the read errored",
   try {
     const e: Error = await bounded(runGit(["log"], "/tmp")).then(
       () => { throw new Error("expected a rejection"); }, (err: Error) => err);
+    expect(e).toBeInstanceOf(IncompleteReadError);
     // The EXACT parenthetical, not a substring: `toContain("EIO: i/o error, read")` alone is also
     // satisfied by the `String(err)` form ("Error: EIO…"), so dropping the `instanceof Error →
     // .message` branch survived it.
@@ -177,12 +179,13 @@ test("the IncompleteReadError names the underlying cause when the read errored",
 test("a HELD (not errored) stdout keeps its original held-pipe wording and no cause", async () => {
   const spy = spyOn(Bun, "spawn").mockImplementation(() =>
     fakeSpawn({ stdout: neverEofStream(["partial"]), stderr: eofStream([]) }));
+  const flush = fastGitFlush();   // the held fake never EOFs, so the window is pure wait
   try {
     const e: Error = await bounded(runGit(["log"], "/tmp")).then(
       () => { throw new Error("expected a rejection"); }, (err: Error) => err);
     expect(e.message).toContain("a child process is holding the pipe");
     expect((e as Error & { cause?: unknown }).cause).toBeUndefined();
-  } finally { spy.mockRestore(); }
+  } finally { flush.restore(); spy.mockRestore(); }
 });
 
 test("an errored STDERR with a complete stdout is still a SUCCESS (stdout-only gate holds)", async () => {
@@ -289,11 +292,12 @@ test("T3.6a — runGit RELEASES a held STDERR reader when stdout completed (one-
   const held = heldWithCancelFlag();
   const spy = spyOn(Bun, "spawn").mockImplementation(() =>
     fakeSpawn({ stdout: eofStream(["deadbeef\n"]), stderr: held.stream }));
+  const flush = fastGitFlush();   // the held fake never EOFs, so the window is pure wait
   try {
     const out = await bounded(runGit(["log"], "/repo"));
     expect(out).toBe("deadbeef\n");          // stdout-only gate still reports success…
     expect(held.wasCancelled()).toBe(true);  // …and the held stderr reader was still released
-  } finally { spy.mockRestore(); }
+  } finally { flush.restore(); spy.mockRestore(); }
 });
 
 test("T3.6b — runGit RELEASES a held STDOUT reader (the mirror, and the one that matters most)", async () => {
@@ -302,13 +306,14 @@ test("T3.6b — runGit RELEASES a held STDOUT reader (the mirror, and the one th
   const held = heldWithCancelFlag();
   const spy = spyOn(Bun, "spawn").mockImplementation(() =>
     fakeSpawn({ stdout: held.stream, stderr: eofStream([]) }));
+  const flush = fastGitFlush();   // the held fake never EOFs, so the window is pure wait
   try {
     await bounded(runGit(["log"], "/repo")).then(
       () => { throw new Error("expected IncompleteReadError"); },
       (e) => { expect(e).toBeInstanceOf(IncompleteReadError); },
     );
     expect(held.wasCancelled()).toBe(true);
-  } finally { spy.mockRestore(); }
+  } finally { flush.restore(); spy.mockRestore(); }
 });
 
 test("T3.6c — a SLOW but healthy git returns its payload; the flush race must not start before exit", async () => {
@@ -343,4 +348,35 @@ test("T3.6c — a SLOW but healthy git returns its payload; the flush race must 
     const out = await bounded(runGit(["log"], "/repo"), 5_000);
     expect(out).toBe("deadbeef commit subject\n");
   } finally { spy.mockRestore(); }
+});
+
+test("the DEFAULT window is what runGit races — on a fresh module AND after fastGitFlush().restore()", async () => {
+  // Pins the EFFECTIVE production window FROM BELOW, not just the exported constant. Git exits at once;
+  // its stdout arrives 300 ms later and closes, so any effective window under ~300 ms turns that into an
+  // IncompleteReadError. From above it is bounded only loosely: the bounds test pins the constant, and an
+  // effective window past ~2.3 s (measured 2026-09-24; less under load, since it is a wall-clock budget)
+  // trips bun's 5 s timeout in extractor.incomplete-read's mixed tests.
+  //
+  // It runs in a CHILD process because this file's own module has already been through
+  // fastGitFlush()/restore(), which wipes whatever the override started as — so an in-process check
+  // could not see a non-undefined initial value, the state production actually runs in.
+  // (Review 2026-09-24: a second copy of the default at 0 or 150, and later an override initialised
+  // to 100, each passed the whole suite.)
+  const root = join(import.meta.dir, "..");
+  const code = `const { runGit } = await import(${JSON.stringify(join(root, "src/git.ts"))});
+const { fastGitFlush } = await import(${JSON.stringify(join(root, "test/fixtures/git-flush.ts"))});
+Bun.spawn = () => ({
+  stdout: new ReadableStream({ async pull(c) { await Bun.sleep(300); c.enqueue(new TextEncoder().encode("late\\n")); c.close(); } }),
+  stderr: new ReadableStream({ start(c) { c.close(); } }),
+  exited: Promise.resolve(0), exitCode: 0, signalCode: null, kill() {},
+});
+const read = () => runGit(["log"], "/repo").then((s) => s, (e) => e.name);
+const fresh = await read();
+fastGitFlush().restore();
+console.log(JSON.stringify({ fresh, restored: await read() }));`;
+  const p = Bun.spawn([process.execPath, "-e", code], { env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
+  const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+  await p.exited;
+  expect(p.exitCode, err).toBe(0);
+  expect(JSON.parse(out.trim().split("\n").at(-1)!)).toEqual({ fresh: "late\n", restored: "late\n" });
 });

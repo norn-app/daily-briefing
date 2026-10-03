@@ -1,3 +1,4 @@
+import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 // Slice 1.5 T0.3 (F5) — `scripts/audit.ts` used to end in a bare `main().catch(...)` with all of its
 // argv- and env-derived state resolved at MODULE scope, so importing it ran the whole audit against
 // the real repos and nothing in it could be tested. These pins hold the extraction in place.
@@ -6,14 +7,15 @@ import { mkdtempSync } from "node:fs";
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 // The import itself is the first assertion: with `import.meta.main` removed, this module would run
 // the audit at import time — and with XDG_CONFIG_HOME unset to a config-less dir it would throw
 // "no-config" straight into `main().catch(...)`, whose handler calls process.exit(1) and takes the
 // whole test runner down with it. There is no way for that regression to look green.
-const emptyCfg = mkdtempSync(join(tmpdir(), "dba-t03-cfg-"));
+const emptyCfg = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-t03-cfg-")));
 process.env.XDG_CONFIG_HOME = emptyCfg;
-const stateA = mkdtempSync(join(tmpdir(), "dba-t03-state-"));
+const stateA = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-t03-state-")));
 process.env.DAILY_BRIEFING_STATE_DIR = stateA;
 
 const audit = await import("../scripts/audit");
@@ -32,7 +34,7 @@ test("T0.3: parseAuditOptions resolves state paths at CALL time, not import time
   // Point the env somewhere else AFTER import — a module-scope `supportDir()` would be frozen at the
   // import-time value and this would still read stateA. This is the property that lets a test (and
   // C4's fixture-config comparison) aim the audit at a throwaway state dir at all.
-  const stateB = mkdtempSync(join(tmpdir(), "dba-t03-state-b-"));
+  const stateB = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-t03-state-b-")));
   process.env.DAILY_BRIEFING_STATE_DIR = stateB;
   const b = audit.parseAuditOptions([]);
   expect(b.supportApp).toBe(stateB);

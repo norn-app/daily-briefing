@@ -1,9 +1,11 @@
+import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 // test/marker.test.ts
 import { test, expect } from "bun:test";
 import { localDateStr, alreadyRanToday, stampToday, supportDir, logPath, rotateLogIfLarge, archivedBriefingPath } from "../src/marker";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 test("localDateStr formats the machine-local date as YYYY-MM-DD", () => {
   const s = localDateStr(new Date(2026, 6, 7, 23, 59));
@@ -11,15 +13,22 @@ test("localDateStr formats the machine-local date as YYYY-MM-DD", () => {
 });
 
 test("once-per-day guard: stampToday makes alreadyRanToday true (DoD §10 item 4)", async () => {
-  process.env.DAILY_BRIEFING_STATE_DIR = mkdtempSync(join(tmpdir(), "dba-marker-"));
+  // RESTORE, never bare `delete` — `bun test` runs every file in one process, so an unconditional
+  // delete here disarms state isolation for every file that runs AFTER this one. Measured: with the
+  // three bare deletes this file used to end its tests with, a full-suite run created
+  // `<HOME>/Library/Application Support/daily-briefing/provider-cwd` in the REAL user state dir; with
+  // them restored, the same run creates nothing. (test/isolation.meta.test.ts pins the shape.)
+  const prev = process.env.DAILY_BRIEFING_STATE_DIR;
+  process.env.DAILY_BRIEFING_STATE_DIR = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-marker-")));
   expect(await alreadyRanToday()).toBe(false);
   await stampToday();
   expect(await alreadyRanToday()).toBe(true); // a second same-day invocation would short-circuit in main.ts
-  delete process.env.DAILY_BRIEFING_STATE_DIR;
+  if (prev === undefined) delete process.env.DAILY_BRIEFING_STATE_DIR; else process.env.DAILY_BRIEFING_STATE_DIR = prev;
 });
 
 test("stampToday(dateStr) stamps the RUN-START date, not now — a midnight-straddling retry run must not consume tomorrow", async () => {
-  process.env.DAILY_BRIEFING_STATE_DIR = mkdtempSync(join(tmpdir(), "dba-marker-"));
+  const prev = process.env.DAILY_BRIEFING_STATE_DIR;
+  process.env.DAILY_BRIEFING_STATE_DIR = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-marker-")));
   try {
     const { markerPath } = await import("../src/marker");
     // Simulate: run started 'yesterday' (before midnight), finishes 'today' — it stamps yesterday.
@@ -29,7 +38,7 @@ test("stampToday(dateStr) stamps the RUN-START date, not now — a midnight-stra
     expect((await Bun.file(markerPath()).text()).trim()).toBe(yStr);
     expect(await alreadyRanToday()).toBe(false); // today is still free to run
   } finally {
-    delete process.env.DAILY_BRIEFING_STATE_DIR;
+    if (prev === undefined) delete process.env.DAILY_BRIEFING_STATE_DIR; else process.env.DAILY_BRIEFING_STATE_DIR = prev;
   }
 });
 
@@ -59,7 +68,7 @@ test("logPath / supportDir honor DAILY_BRIEFING_STATE_DIR (shared with scripts/a
 });
 
 test("rotateLogIfLarge: truncates an over-cap log in place, keeps one .1 generation; no-op when small/absent [Tier-5]", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "dba-logrot-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-logrot-")));
   const log = join(dir, "briefing.log");
   writeFileSync(log, "x".repeat(100));
   await rotateLogIfLarge(log, 50); // 100 > 50 → rotate
@@ -78,7 +87,8 @@ test("rotateLogIfLarge: truncates an over-cap log in place, keeps one .1 generat
 });
 
 test("archivedBriefingPath: shape-guards its one interpolated component [Tier-5]", () => {
-  process.env.DAILY_BRIEFING_STATE_DIR = mkdtempSync(join(tmpdir(), "dba-arch-"));
+  const prev = process.env.DAILY_BRIEFING_STATE_DIR;
+  process.env.DAILY_BRIEFING_STATE_DIR = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-arch-")));
   expect(archivedBriefingPath("2026-08-14")).toEndWith(join("briefings", "2026-08-14.md"));
   // Measured in review: without the guard this escaped the state dir entirely. No production caller
   // can reach it — `runDate` is machine-generated — but the calibration harness this feeds will take
@@ -86,5 +96,5 @@ test("archivedBriefingPath: shape-guards its one interpolated component [Tier-5]
   expect(() => archivedBriefingPath("../../etc/passwd")).toThrow(/YYYY-MM-DD/);
   expect(() => archivedBriefingPath("")).toThrow(/YYYY-MM-DD/);
   expect(() => archivedBriefingPath("2026-8-4")).toThrow(/YYYY-MM-DD/);
-  delete process.env.DAILY_BRIEFING_STATE_DIR;
+  if (prev === undefined) delete process.env.DAILY_BRIEFING_STATE_DIR; else process.env.DAILY_BRIEFING_STATE_DIR = prev;
 });

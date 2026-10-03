@@ -5,17 +5,21 @@
 // a thin shell around it (gates → runCore → render/stamp/exit), and the eval harness scores the very
 // same runCore, so there is no second copy to drift.
 import { hostname, homedir } from "node:os";
-import { discoverRepos, DEFAULT_BUDGET, repoLabel, resolveTranscripts, resolveAccounts } from "./config";
-import { gitActivity, type RepoProbe } from "./extractor";
+import { discoverRepos, DEFAULT_BUDGET, DEFAULT_NETWORK_PROBE_HOSTS, repoLabel, resolveTranscripts, resolveAccounts, resolveVerdictPaths, resolveRecapCampaigns } from "./config";
+import { shaPrefixMatch } from "./sha";
+import { gitActivity, mapLimit, REPO_SCAN_CONCURRENCY, type RepoProbe } from "./extractor";
 import { reduce } from "./reduce";
-import { generateBriefing, norm } from "./generator";
+import { generateBriefing, norm, countPipelessRecapEvidence } from "./generator";
 // The output-side DIAGNOSTICS, called near the foot of `runCore`. They live at this layer — not in
 // `generateBriefing` — because the struct is not final until this file stops writing to it.
-import { checkResumeFreshness, checkSuggestionRestatement } from "./postcheck";
+import { checkResumeFreshness, checkSuggestionRestatement, checkSuggestionVolume, type PostFinding } from "./postcheck";
+import { diagError } from "./diag";
 import { parseFloor } from "./schedule";
 import { resolveAccount, effectiveAccounts, loadAccountState, recordLimit, recordAuthProbe, clearMark, parseResetInstant, outageReport } from "./account";
-import { withRetry, withHardeningLadder } from "./provider";
-import { hardenedProvider, type HardenedProvider } from "./harden";
+import { withRetry, withHardeningLadder, TIMEOUT_MS } from "./provider";
+import { type HardenedProvider } from "./harden";
+import { buildProvider, providerLabel } from "./providerFactory";
+import { deriveProbeHosts } from "./providers/endpoint";
 
 /** Read a provider's accumulated DYNAMIC warnings (C1/B8). Structural rather than an `instanceof` so an
  *  injected test double can carry them and a plain `Provider` is simply a no-op — the wire should work
@@ -35,8 +39,18 @@ function appendUnique(base: readonly string[], extra: readonly string[]): string
   for (const w of extra) if (!seen.has(w)) { seen.add(w); out.push(w); }
   return out;
 }
-import { localDateStr, supportDir, readLastRunDate } from "./marker";
+import { localDateStr, supportDir, readLastRunDate, recapCampaignsPath } from "./marker";
 import { join } from "node:path";
+import { appendFile } from "node:fs/promises";
+// Tier B (Stage-2 recap campaigns). The phase module never imports this file (plan §2 / D17; pinned by
+// test/recap-campaigns.imports.test.ts), so this edge cannot close a cycle.
+import { runRecapCampaignsPhase } from "./recapCampaignsPhase";
+import { branchWords, type RecapImpl } from "./recapCampaigns";
+import { REDACTION } from "./transcripts/credentials";
+
+/** A PR branch as a printed `🔀 Merged` line shows it: verbatim, unless `branchWords` — Stage 2's
+ *  any-case, before-and-after-the-strip credential decision — redacts it, in which case all of it. */
+const shownBranch = (branch: string): string => (branchWords(branch) === REDACTION ? REDACTION : branch);
 import { claudeShaped } from "./harden";
 import { scanTranscripts } from "./transcripts/scan";
 import { whySourceFor } from "./transcripts/join";
@@ -47,7 +61,7 @@ export const TRANSCRIPT_READ_MARGIN_MS = 24 * 3_600_000;
 import { isInaccessible, warnFor, type PathIssue, type GuardOpts } from "./protectedPath";
 import { uncommittedFileList, isBranchNotable } from "./git";
 import { ProviderError, type DoneItem, type Provider, type BriefingStruct, type Activity, type Config, type ReducedContext } from "./types";
-import { resolveUnits, unitForCommit, unitForFiles, repoLabelFor, rootsForRepo, unitKey, INFRA_DENYLIST, type Unit } from "./subprojects";
+import { resolveUnits, unitForCommit, unitForFiles, repoLabelFor, rootsForRepo, unitKey, subprojectLegend, INFRA_DENYLIST, labelBoundary, type Unit } from "./subprojects";
 import { resolveProbeHosts, waitForNetwork, defaultNetProbe, realSleep } from "./net";
 import { isFullyAwake } from "./power";
 
@@ -78,9 +92,12 @@ export type RunDeps = {
   /** §3.2's ambiguity policy, threaded to the join. Declaring the field without threading it is the
    *  defect T3.3 made it injectable to avoid — MUT2 is the only detector that the drop is live. */
   onAmbiguity?: "drop" | "keep-earliest";
-  /** Injected clock. It owns exactly TWO new call sites — the scan's localDay bucketing and the read
-   *  window's `now` end. It does NOT replace runDate/stateAsOf/extractor time, which are existing
-   *  behaviour with existing tests; replacing those would change behaviour for every current user. */
+  /** Injected clock (`clockNow` below). It was introduced owning exactly TWO call sites — the scan's
+   *  localDay bucketing and the read window's `now` end; outage computation, account selection and limit
+   *  recording joined later (each noted where `clockNow` is hoisted), and tier B's PR-fact window
+   *  `[windowStart, now)` is one more owned site (spec Appendix D14). It does NOT replace
+   *  runDate/stateAsOf/extractor time, which are existing behaviour with existing tests; replacing those
+   *  would change behaviour for every current user. */
   now?: () => Date;
   /** Injected transcript reader, so the scan is testable without a real corpus. */
   scan?: typeof import("./transcripts/scan").scanTranscripts;
@@ -89,6 +106,22 @@ export type RunDeps = {
   /** Prior health history, so §3.8's multi-day triggers (zero-yield) are testable without a state dir. */
   priorHealth?: import("./transcripts/health").TranscriptHealth;
   preWarnings?: string[];                // shell-supplied warnings (e.g. floor.warning) folded in BEFORE the empty/blocked return, so they reach the struct exactly as production run() surfaced them
+  /** Tier-B transport: the raw provider reply text for one prompt. Production wraps the run's own
+   *  provider instance; tests and the offline replay inject canned text or a thrown ProviderError.
+   *  It returns TEXT, never campaigns — validation and apply run on the engine side of this seam.
+   *  (Spec §4.2.) Unset with an injected `provider` ⇒ B records `skipped`/`no-grouper`. */
+  grouper?: (prompt: string) => Promise<string>;
+  /** Tier-B record writer (spec §4.10 1; the `persistHealth` seam pattern). Unset ⇒ one line appended to
+   *  `recapCampaignsPath()` in the state dir. `main.ts` never sets it. */
+  persistRecapRecord?: (line: string) => Promise<void>;
+  /** Spec Appendix D8: who invoked the run and whether it was `run --json`, copied into B's record.
+   *  `main.ts` passes it; absent ⇒ `"invoker":"unknown"`, `json` defaults to `false`. */
+  recapInvocation?: { invoker: string; json: boolean };
+  /** Tests only, passed through to the phase as `seams`: a short `D_call` (F17/P9), a git budget
+   *  (P10's 0), and the implementation seam (F20–F22). Production leaves all three unset. */
+  recapCallDeadlineMs?: number;
+  recapGitBudgetMs?: number;
+  recapImpl?: Partial<RecapImpl>;
 };
 
 // The launchd 7:20 job coalesces to fire the moment a slept-through-7:20 laptop wakes — often
@@ -132,6 +165,176 @@ export function branchStateLines(
   return out;
 }
 
+/** IN-10: a stash message that states its own HOLD or OWNERSHIP ("not mine", "parked for relay
+ *  start", "keep for later", "Sam's WIP", "don't drop"). Read ONLY from the `<msg>` half of the
+ *  user's own `On <branch>: <msg>` stash message — never the branch (a branch named `parked/x` says
+ *  nothing about this stash), and never git's automatic `WIP on <branch>: <sha> <subject>`, whose text
+ *  is the HEAD commit's subject and says nothing about the stash.
+ *
+ *  This is the generation prompt's own marker rule (generator.ts: SUGGESTIONS must not propose lifting
+ *  a condition someone set deliberately) applied to the code-built channel. "Pop or drop" on someone
+ *  else's parked work is that proposal, and the day-50 judge asked for the parked stash to stay in
+ *  "Where you left off" only.
+ *
+ *  ⚠ THE COSTS ARE LOPSIDED, SO THE VOCABULARY LEANS TOWARD SUPPRESSION ON PURPOSE. A false match is
+ *  silence — exactly the pre-IN-10 briefing, and the stash still renders on its RESUME line. A MISS is
+ *  a daily "drop" nag about work the user said to leave, possibly someone else's. So the list is wide
+ *  (keep, leave, hold, park, pause, later, until, backup, archive, skip, ignore, pending review, a
+ *  possessive, do-not-X …), and a work message that uses a hold phrase literally ("blocked on the
+ *  mutex fix", "held for the new API") is accepted as silence.
+ *
+ *  ⚠ …BUT IT MATCHES WHOLE WORDS, AND `-`, `_` AND `/` DO NOT END A WORD HERE. `\b` breaks on a
+ *  hyphen, so `parked-car detector`, `not mine-sweeper` and `frozen until-loop refactor` read as holds
+ *  — compound names, not statements. Hyphenated HOLD forms (`do-not-drop`, `dont-drop`) are spelled
+ *  out inside the phrases instead.
+ *
+ *  MEASURED on review round 1's phrasings (43 ways of saying "leave this", 22 ordinary work messages):
+ *  the first list held 6/43 and silenced 10/22; this one holds 42/43 and silences 6/22. The one hold
+ *  phrasing left unmatched is "old attempt" — it calls the stash obsolete, which is what "drop"
+ *  proposes. The six silenced work messages each use a hold phrase literally — the accepted
+ *  direction. The archive's own two messages: `not mine, parked for relay start` matches;
+ *  `pre-HEAD-fix: local STATE.md edits` does not. ⚠ Still NOT calibrated on real stash messages: the
+ *  whole archive holds two. */
+const STASH_WORD_START = "(?<![\\p{L}\\p{N}_/-])";
+const STASH_WORD_END = "(?![\\p{L}\\p{N}_/-])";
+const STASH_HOLD_PHRASES = [
+  // ownership
+  "not[\\s-]+(?:mine|yours|ours|my|for[\\s-]+me)",
+  "(?:someone|somebody|anyone)[\\s-]+else['’]?s",
+  "\\p{L}+['’]s[\\s-]+(?:changes|wip|work|edits|stash|stuff|patch|diff|code|copy|version|branch|experiment|review)",
+  // keep / leave / hold / park / pause
+  "keep(?![\\s-]+(?:going|trying|working|up|on|at)(?![\\p{L}\\p{N}_]))",
+  "leave[\\s-]+(?:it|this|alone|as[\\s-]+is|be)",
+  "hold(?:ing)?", "held[\\s-]+(?:for|until|till|back|off)", "on[\\s-]+(?:hold|ice)",
+  "park(?:ed)?", "parking[\\s-]+(?:this|it|here)",
+  "paus(?:e|ed|ing)", "postponed?",
+  // deferred to a time or a condition
+  "later", "some[\\s-]?day", "until", "till",
+  "for[\\s-]+(?:now|tomorrow|next[\\s-]+(?:week|sprint|release)|(?:mon|tues|wednes|thurs|fri|satur|sun)day)",
+  "(?:blocked|frozen|deferred)[\\s-]+(?:on|by|until|till|for|to|behind)",
+  "wait(?:ing)?[\\s-]+(?:for|on|until|till)",
+  "(?:needs?|pending|awaiting|await|for)[\\s-]+review",
+  // kept as a copy, or not to be acted on
+  "backup", "back[\\s-]+up", "bak", "bkp", "(?:reference|ref)[\\s-]+only", "for[\\s-]+reference", "archived?",
+  "skip", "ignored?",
+  // do not X
+  "(?:do(?:[\\s-]+not|n['’]?t)|never)[\\s-]+(?:touch|pop|apply|drop|delete|remove|clear|lose|merge|commit|use)",
+];
+export const STASH_INTENT_RE = new RegExp(`${STASH_WORD_START}(?:${STASH_HOLD_PHRASES.join("|")})${STASH_WORD_END}`, "iu");
+
+/** At most this many stash lines per briefing. The archive's measured need is one (a single unmarked
+ *  stash across 33 days); the bound keeps a stash hoarder from burying the model's forward work. */
+export const STASH_SUGGESTIONS_MAX = 1;
+
+type StashSuggestion = BriefingStruct["suggestions"][number];
+
+/** IN-10 — PERSISTING STASHES BECOME A SUGGESTION (EVAL days 47, 57, 58, 60, 63). The briefing named
+ *  both stashes in "Where you left off" on 25 of 26 mornings since 08-22 and proposed an action on two;
+ *  the judge filed the missing "apply or drop" line on days 51, 57, 63 and praised it on day 62. Returns
+ *  the entries to APPEND — LAST, after the model's suggestions: stash housekeeping must not displace
+ *  forward work. Code-built from the raw stash activities (git.ts `resumptionSignals`), so a budget
+ *  trim cannot drop it — the reasoning `branchStateLines` gives above. `[]` when nothing qualifies, so
+ *  a stash-free morning ships the pre-IN-10 struct.
+ *
+ *  A stash QUALIFIES when (a) its ref is `stash@{N}` (it can be named), (b) its own message carries no
+ *  intent marker (`STASH_INTENT_RE`), and (c) no existing suggestion already names that ref for that
+ *  repo — under ANY of the repo's lane labels, not only the catch-all's: an S1 promotion or a model
+ *  line written under a sub-project bracket (`[parser] pop stash@{0}`) is the same stash (the model
+ *  wrote the line itself on days 53 and 62). The ref match is exact (`stash@{N}`); prose that names a
+ *  stash without its ref ("the pre-HEAD-fix stash") is not parsed. The OLDEST qualifier wins — the
+ *  day-63 judge asked for age-weighting. NO AGE THRESHOLD: the archive holds no short-lived stash to
+ *  calibrate one against, and the judge asked for this stash on its creation day (day 51, age 0) as
+ *  well as at ages 6 and 12.
+ *
+ *  ⚠ THE TEXT IS FIXED AT `Pop or drop stash@{N}` AND THAT IS A MEASURED CONSTRAINT, NOT STYLE. `Pop`,
+ *  not `Apply`: `git stash apply` KEEPS the stash, so after apply-and-commit the identical line would
+ *  return the next morning. (EVAL rows 51 and 62 quote "needs pop/drop" and "keep-or-drop" — those are
+ *  the BRIEFING's own RESUME lines quoted by the row, not the judge's wording.)
+ *  The line is scored by `postcheck.checkSuggestionRestatement` like any
+ *  suggestion — this channel adds NO skip there or anywhere else, so G6 and the delivery-path
+ *  diagnostic see exactly what they saw before (an eval check's observed set is an eval-integrity
+ *  decision; see the PENDING OPERATOR ACK on S1's skip). The text has THREE topical tokens (pop, drop,
+ *  stash) for every ref below 100, so it can share at most 3 with any bullet, and the COUNTED
+ *  `suggestion-restates` rule cannot fire on it. ⚠ That rests on `MIN_SHARED_TOKENS = 4` ALONE, not on
+ *  the containment score: against a RESUME line that itself says "pop" and "drop" beside the stash the
+ *  line scores 1.00 on 3 shared tokens — far above `RESTATEMENT_THRESHOLD` — and only the token floor
+ *  holds it back (the first wording already scored 0.67 on 2 shared on 09-05, whose stash line EVAL
+ *  day 51 quotes as "needs pop/drop"). Lower that floor to 3 and this line trips the counted rule.
+ *  MEASURED for the first wording (`Apply or drop …`, the same three-token shape) by replaying this
+ *  function over the real archive (32 real days plus the recovered day 61): the line lands on 10
+ *  mornings, the archive's counted findings are unchanged (10 before, 10 after), and a text carrying
+ *  the stash message would trip the counted rule on all 10. `Pop` cannot change the counted side —
+ *  three tokens either way, and suggestions are scored one at a time. Pinned by
+ *  test/in10-stash-suggestions.test.ts.
+ *
+ *  The stash's own message is USUALLY on the RESUME line above — but not always, so the line does not
+ *  lean on it: the deterministic backfill lists only the first `STASH_NOTES_SHOWN` (2) stashes and then
+ *  `+N more`, so an OLDEST stash at index ≥ 2 has no message anywhere on the page; and when the model
+ *  writes its own RESUME bullet for the unit the backfill does not run at all. The ref and the age are
+ *  what the reader needs to find it (`git stash list`).
+ *
+ *  ⚠ CALIBRATION CONSUMERS (repeated beside NEAR_MISS_FLOOR and S1's skip in postcheck.ts): it DOES log
+ *  near-miss telemetry (`postcheck-info [suggestion-restates-near]`, info-only, uncounted) whenever a
+ *  RESUME bullet shares one of its tokens. MEASURED for the shipped `Pop` wording (archive read in
+ *  place, 33 days incl. the real day 61 recovered from briefing.log): 8 of the 13 near-miss rows over
+ *  09-05..09-18 (61.5%). Two score ABOVE RESTATEMENT_THRESHOLD — 09-05 at 1.00 with 3 shared tokens and
+ *  09-09 at 0.67 with 2 — and are held back only by MIN_SHARED_TOKENS = 4. Anyone building a threshold corpus from
+ *  near-miss rows must filter suggestions matching `^Pop or drop stash@\{\d+\}$`: they are this
+ *  code-built line, not model behaviour. Excluding them at the source was ruled out (operator ruling,
+ *  IN-10 design approval): it would narrow what a counted diagnostic observes — the class of change
+ *  S1's skip is still pending operator ack for.
+ *  ⚠ S3 TOO: the entry carries `repo` (the catch-all label), which `checkSuggestionVolume` folds into
+ *  the text — so the line counts as a forward step "mentioning" that unit and can silence an info-only
+ *  `suggestion-volume-miss` row for it (measured by review round 1 on a constructed case; no row in
+ *  briefing.log names the stash's repo, so no historical row moves). IN-4's SAME-DAY leg does NOT count
+ *  it (nor S1 promotions): replayed over the archive, counting it would have silenced day 64's
+ *  `personal_code` same-day row — see `checkSuggestionVolume`'s "WHICH LINES COUNT".
+ *
+ *  Age goes in `stash`, rendered as a label OUTSIDE the text (`render.ts stashLabel`), the way
+ *  `(from resume)` is — so it never reaches the restatement score, and the text carries no hex run for
+ *  IN-2's `markVerdictPathSuggestions` to read as a citation. `stash.branch` keeps git's literal, but
+ *  the label shows only `no branch` — see `stashLabel` for why a branch name must not render. */
+export function stashSuggestions(
+  activities: readonly Activity[], repoPaths: string[], units: readonly Unit[],
+  existing: readonly StashSuggestion[], runDate: string,
+): StashSuggestion[] {
+  const REF = /^stash@\{(\d+)\}$/;
+  const dayMs = (d: string) => Date.parse(`${d}T00:00:00Z`);
+  const candidates: { entry: StashSuggestion; when: number; n: number }[] = [];
+  for (const a of activities) {
+    if (a.kind !== "stash" || !a.repo || !a.target) continue;
+    const m = REF.exec(a.target);
+    if (!m) continue;                                                   // (a) unnameable
+    // git.ts writes `${ref}: ${%gs}`; %gs is `On <branch>: <msg>` (stash push -m) or
+    // `WIP on <branch>: <sha> <subject>` (plain stash). A branch name cannot contain ":" (git
+    // check-ref-format), so the first ": " ends it.
+    const gs = (a.text ?? "").startsWith(`${a.target}: `) ? (a.text ?? "").slice(a.target.length + 2) : "";
+    const own = /^On (.+?): ([\s\S]*)$/.exec(gs);
+    const wip = own ? null : /^WIP on (.+?): /.exec(gs);
+    if (own && STASH_INTENT_RE.test(own[2]!)) continue;                  // (b) the user said hold
+    const label = units.find((u) => u.repo === a.repo && u.root === null)?.label ?? repoLabelFor(a.repo, repoPaths);
+    const text = `Pop or drop ${a.target}`;
+    const lanes = [...new Set([label, ...units.filter((u) => u.repo === a.repo).map((u) => u.label)])].map((l) => labelBoundary(norm(l)));
+    const named = existing.some((s) => s.text.toLowerCase().includes(a.target!.toLowerCase())
+      && lanes.some((bounded) => bounded.test(norm(s.repo ? `[${s.repo}] ${s.text}` : s.text))));
+    if (named) continue;                                                // (c) already on the list
+    const when = Date.parse(a.timestamp ?? "");
+    const days = Number.isFinite(when) ? Math.round((dayMs(runDate) - dayMs(localDateStr(new Date(when)))) / 86_400_000) : NaN;
+    // A date AFTER the run date is clock skew: omit the age rather than claim "made today" beside a
+    // RESUME line that prints the future date. (git.ts's `date || now` fallback for a stash with NO
+    // date still reads as "made today" — that fallback feeds other consumers and is left alone.)
+    const age = days >= 0 ? days : NaN;
+    const branch = (own ?? wip)?.[1];
+    candidates.push({
+      entry: { text, repo: label, stash: { ...(branch !== undefined ? { branch } : {}), ...(Number.isFinite(age) ? { ageDays: age } : {}) } },
+      when: Number.isFinite(when) ? when : Infinity, n: Number(m[1]),
+    });
+  }
+  // Oldest first; on an equal date the deeper stack entry (larger N) is the older one.
+  candidates.sort((x, y) => x.when - y.when || y.n - x.n);
+  return candidates.slice(0, STASH_SUGGESTIONS_MAX).map((c) => c.entry);
+}
+
 /** One repo whose working tree changed between extraction and render. `resolved` is the files that
  *  WERE dirty and no longer are — the only ones that can make a suggestion stale. */
 export type WorkingTreeDrift = { label: string; was: string; now: string; resolved: string[] };
@@ -146,19 +349,76 @@ export type WorkingTreeDrift = { label: string; was: string; now: string; resolv
 const joinedListHas = (joined: string, f: string): boolean =>
   joined === f || joined.startsWith(`${f}, `) || joined.endsWith(`, ${f}`) || joined.includes(`, ${f}, `);
 const fileList = (s: string) => s.split(", ").map((f) => f.trim()).filter(Boolean);
+/** INFRA (agent-scratch) paths, dropped from a file list. See the denylist note in
+ *  `computeWorkingTreeDrift` for why this gates the EMISSION and not only `resolved`. */
+const dropInfra = (files: string[]) => files.filter((f) => !INFRA_DENYLIST.some((d) => f.includes(d)));
+const hasInfra = (joined: string) => INFRA_DENYLIST.some((d) => joined.includes(d));
 
 /** The measurement half of the drift re-check, split out so the warning text and the suggestion
- *  annotation are computed from ONE `statusNow` read per repo rather than two. */
+ *  annotation are computed from ONE `statusNow` read per repo rather than two.
+ *
+ *  ⚠ BIDIRECTIONAL (day-20 finding, two sightings). This used to walk `uncommitted` — i.e. only the
+ *  repos that were ALREADY DIRTY at extraction — so drift could only ever be observed in the
+ *  dirty→clean direction. A repo that was CLEAN at extraction and picked up edits during generation
+ *  was structurally invisible: the loop had no entry to iterate for it. That is the half of the
+ *  window where "Where you left off" is most wrong, because the briefing asserts nothing is pending
+ *  in a repo that now has pending work. Every CONFIGURED repo is re-read now, clean or not.
+ *
+ *  ⚠ CONCURRENTLY, with the extractor's own bound. The extraction scan already decided that per-repo
+ *  git reads are independent and must not serialize (one repo on a hung network mount would otherwise
+ *  hold the whole render behind it) — and this re-check runs at the very end of a run, after the
+ *  model call, where a serial walk over every configured repo is the worst place to add wall time.
+ *  `mapLimit`/`REPO_SCAN_CONCURRENCY` are imported rather than re-derived so the two scans cannot
+ *  drift apart on the bound; `mapLimit` is order-preserving, so the emitted order is `repoPaths`
+ *  order regardless of which repo's `git status` returns first.
+ *
+ *  The unverifiable-goes-silent branch is unchanged — a `statusNow` that throws still yields NOTHING
+ *  for that repo rather than a guess, in both directions.
+ *
+ *  ⚠ THE TWO DIRECTIONS HAVE DIFFERENT AUDIENCES, and that asymmetry is deliberate (round-2 review).
+ *    - clean→dirty: `contributing` only — the repos that actually produced briefing content. This
+ *      direction makes no claim stale; it is pure advice to re-verify "Where you left off", which
+ *      only means something for a repo the briefing said something about. Discovery walks two levels
+ *      under each root, so `repoPaths` is routinely dozens of repos (vendored clones, scratch
+ *      checkouts) the author-filtered briefing never mentions; warning about a build artefact
+ *      landing in one of those is advice about work the reader was never shown — and each re-probe
+ *      is a `git status` bounded only by GIT_TIMEOUT_MS, paid after the model call.
+ *    - dirty→clean: EVERY repo dirty at extraction, contributing or not. Its files can annotate a
+ *      suggestion (`resolved` → `annotateStaleSuggestions`), so this direction can invalidate a
+ *      claim the briefing already made; narrowing it would drop a correction, not just an advisory.
+ *
+ *  ⚠ THE INFRA_DENYLIST GATES EMISSION AND RENDER, NOT JUST `resolved` (round-2 review). Both sides
+ *  are filtered BEFORE the compare, and `was`/`now` are built from the filtered lists — so a repo
+ *  whose only delta is an agent worktree appearing or vanishing emits nothing at all. Filtering only
+ *  `resolved` (the shape this shipped as) left the decision to warn, and the printed paths, on the
+ *  raw `git status` strings: `resolveUnits` (subprojects.ts) and `applySuggestionGuards` (generator.ts) strip INFRA paths before
+ *  the prompt and before suggestions, so the model PROVABLY never saw one, and a warning built on
+ *  one tells the reader their pending work changed on the strength of something they were never
+ *  shown. Raw strings are kept verbatim when they carry no INFRA path, so the no-split invariant
+ *  `joinedListHas` exists to protect is untouched on every real-world path. */
 export async function computeWorkingTreeDrift(
   uncommitted: Activity[], repoPaths: string[],
   statusNow: (repo: string) => Promise<string> = uncommittedFileList,
+  contributing: string[] = repoPaths,
 ): Promise<WorkingTreeDrift[]> {
-  const drifts: WorkingTreeDrift[] = [];
+  // Extraction-time dirty state, indexed by repo. A repo with NO entry here was clean at extraction:
+  // `was` is "" — a real measurement, not a missing one, which is exactly why it can drift.
+  const wasByRepo = new Map<string, Activity>();
   for (const a of uncommitted) {
     if (a.kind !== "uncommitted" || !a.repo) continue;
-    const was = (a.text ?? "").replace(/^Uncommitted changes: /, "");
-    const now = await statusNow(a.repo).catch(() => null);
-    if (now === null || now === was) continue; // unverifiable → stay silent; unchanged → fine
+    if (!wasByRepo.has(a.repo)) wasByRepo.set(a.repo, a);   // first entry wins — one status read per repo
+  }
+  // `contributing` FIRST (it defines the scan set, and defaults to `repoPaths`), then any dirty repo
+  // outside it — dropping those would turn this widening into a regression for the one-directional
+  // case it is meant to preserve. Labels still disambiguate against the FULL `repoPaths`, so a
+  // narrower scan cannot change how a repo is named.
+  const targets = [...new Set([...contributing, ...wasByRepo.keys()])];
+
+  const measured = await mapLimit(targets, REPO_SCAN_CONCURRENCY, async (repo): Promise<WorkingTreeDrift | null> => {
+    const a = wasByRepo.get(repo);
+    const wasRaw = (a?.text ?? "").replace(/^Uncommitted changes: /, "");
+    const nowRaw = await statusNow(repo).catch(() => null);
+    if (nowRaw === null) return null;             // unverifiable → stay silent
 
     // ⚠ Prefer the STRUCTURED list. `was` is recovered by regex-stripping rendered prose and then
     // re-splitting on ","; that was harmless while it only fed display text, but it now feeds a
@@ -166,23 +426,37 @@ export async function computeWorkingTreeDrift(
     // ["has", "comma.md"]) and a 3-char token matches ordinary English prose, producing a false
     // "already committed" on an unrelated suggestion. `meta.uncommittedFiles` is the real array the
     // git layer already carries; the split stays only as a fallback for activities without it.
-    const wasFiles = a.meta?.uncommittedFiles ?? fileList(was);
-    drifts.push({
-      label: repoLabel(a.repo, repoPaths), was, now,
-      // ⚠ INFRA paths are dropped here, not by the caller. `subprojects.ts` strips them before the
-      // prompt and `generator.ts` strips suggestions containing them, so the model PROVABLY never
-      // saw one — any match against a resolved agent-scratch path is coincidental by construction,
-      // and annotating on it marks live work done. This restores an invariant the codebase already
-      // asserts at two other layers.
-      resolved: wasFiles.filter((f) => !joinedListHas(now, f) && !INFRA_DENYLIST.some((d) => f.includes(d))),
-    });
-  }
-  return drifts;
+    // For a clean-at-extraction repo this is `[]`, so the clean→dirty direction contributes a
+    // WARNING and nothing else: there is no prior claim for it to invalidate. An activity carrying
+    // an EMPTY list is the same measurement as no activity at all — both are "nothing was pending",
+    // and the two must stay indistinguishable downstream.
+    const wasFiles = dropInfra(a?.meta?.uncommittedFiles ?? fileList(wasRaw));
+    // ⚠ Split ONLY when there is something to strip. Re-splitting a `git status` join is the hazard
+    // `joinedListHas` exists to avoid (a path containing ", " shatters), so the raw string is passed
+    // through verbatim unless it actually carries an INFRA path — which is every real repo, every
+    // day, except the one this filter is for.
+    const was = hasInfra(wasRaw) ? wasFiles.join(", ") : wasRaw;
+    const now = hasInfra(nowRaw) ? dropInfra(fileList(nowRaw)).join(", ") : nowRaw;
+    if (now === was) return null;                 // unchanged once agent scratch is excluded → fine
+
+    return {
+      label: repoLabel(repo, repoPaths), was, now,
+      // `wasFiles` is already INFRA-filtered, so nothing agent-scratch can reach an annotation:
+      // any match against a resolved agent-scratch path would be coincidental by construction, and
+      // annotating on it marks live work done.
+      resolved: wasFiles.filter((f) => !joinedListHas(now, f)),
+    };
+  });
+  return measured.filter((d): d is WorkingTreeDrift => d !== null);
 }
 
 export function driftWarnings(drifts: WorkingTreeDrift[]): string[] {
   return drifts.map((d) =>
-    `working-tree changed while generating: [${d.label}] was "${d.was}" → ` +
+    // ⚠ `was ""` would be the literal rendering for the clean→dirty direction, which reads as a bug
+    // rather than as a measurement. Spelled out, symmetrically with the `now` side. Only the
+    // dirty→clean branch is legacy text, and it is byte-identical to what it always was.
+    `working-tree changed while generating: [${d.label}] ` +
+    `${d.was === "" ? "was clean" : `was "${d.was}"`} → ` +
     `${d.now === "" ? "now clean (auto-committed?)" : `now "${d.now}"`} — re-verify "Where you left off" before acting`);
 }
 
@@ -281,11 +555,108 @@ export function annotateStaleSuggestions<T extends { text: string }>(
       : { ...s, text: s.text + STALE_NOTE });
 }
 
+/** What the verdict-path key reads as a commit citation: a run of 7–40 hex characters not glued to a
+ *  letter or digit on either side — at least the 7-char abbreviation the prompt itself prints
+ *  (`activityLine`, generator.ts), the same 7-char floor `eval/checks.ts`' `evidenceCandidates`
+ *  extracts on. Shorter runs are ignored rather than tried: prose is full of 4–6-char hex-shaped words
+ *  and numbers (`decade`, `e2e4`, `2026`), and this key must never mark a suggestion on a coincidental
+ *  prefix. All-digit 7+ abbreviations ARE admitted (the `4760499` class `recapCoverage` and
+ *  `clusterRecap` both had to learn about) — a run only counts once it resolves to exactly one real
+ *  commit, below. Case-insensitive; `shaPrefixMatch` lower-cases both sides.
+ *
+ *  ⚠ A SCAN, NOT `sha.ts`' `evidenceTokens` + `bareToken`, which the first cut used (IN-2 cold review,
+ *  lens 1 LOW-1). Those split on commas/whitespace and strip EDGE adornments only, so a citation joined
+ *  to other text — `6645a53's`, `a/b`, `a..b`, `sha—`, `sha:path`, `x@sha`, `sha…` — was never read:
+ *  5 of the 71 hex runs in the archived suggestions, one of them a real miss (day 57's "confirm
+ *  6645a53's undated-flow rejection" cites an in-window `quant_stocks/live` commit). Widening those
+ *  helpers instead would move `verifyEvidence`, `clusterRecap` and `recapCoverage` — EVAL-recorded
+ *  paths — mid-batch, so they are untouched. What the helpers read is still read: their token is hex
+ *  bounded by whitespace, commas, parens or edge adornments, none of them a letter or digit (the one
+ *  exception, hex split by a parenthesis that the helpers glued back — `ab(12345678)` — is not a
+ *  citation anyone writes). */
+const CITED_SHA = /(?<![0-9a-z])[0-9a-f]{7,40}(?![0-9a-z])/gi;
+
+/**
+ * IN-2 (EVAL days 51/52) — stamp `verdictPath: true` on each suggestion that CITES a commit whose
+ * diffstat touches an operator-configured verdict path. Pure; `prefixes` comes from
+ * `resolveVerdictPaths`, so `[]` (the default — key unset) returns `suggestions` itself, untouched.
+ *
+ * ⚠ THE KEY IS GIT-DERIVED, NOT PROSE, and that was the whole design question. A suggestion is model
+ * prose: its `[label]` is model-typed (IN-3's cold review, lens 1 MED-1, flagged a recap lane read
+ * from exactly that bracket), its `repo` field on a promoted entry is copied from a model-typed RESUME
+ * bracket, and the paths it names are free text. What CAN be checked against ground truth is a cited
+ * SHA: a token either resolves to ONE real commit in this run's git activity or it does not, and a
+ * resolved commit's diffstat is git's own record of what it touched. The model still chooses WHICH commit to cite — that is what
+ * "the suggestion is about" means — but it cannot relabel, garble or invent its way to a marker: a
+ * fabricated or ambiguous token resolves to nothing and marks nothing. MEASURED on the 15 archived
+ * briefings of days 49-64 (37 suggestions; commits re-listed per day through `listCommits`, pooled up
+ * to each briefing's date — a superset of the production window): 18 cite a 7+-hex token and all 18
+ * resolve uniquely; 6 resolve to a commit under `quant_stocks/`/`quant_options/`, every one touching
+ * ONLY those paths. Three of those six carry NO `[label]`, day 52's own example among them — the item
+ * that cleared the evidence gate — so a label key would have missed the one case the feature exists
+ * for, while its cited `0d741d9` marks it. RE-MEASURED with the `CITED_SHA` scan (IN-2 round 1; each
+ * day's production window via `windowStart` plus that day's commits before its `state as of`): 7 of
+ * 37 marked on days 49-64 — those six plus day 57's possessive `6645a53's` — and 10 of 68 across the
+ * whole 33-briefing archive; no suggestion loses a token the first cut read.
+ *
+ * FAILURE MODES, stated rather than elided:
+ *   - FALSE NEGATIVE, no citation: a suggestion about verdict-path work that cites no SHA stays
+ *     unmarked. In the corpus that is the `(from resume)` promotions — verbatim resume tails that
+ *     carry no SHA (two `[quant_stocks]` echoes on days 56 and 63, plus day 51's unlabelled "wiring
+ *     that input into rule 2"). An unmarked suggestion is exactly today's rendering, so this errs
+ *     toward the status quo, never toward a false claim.
+ *   - FALSE NEGATIVE, unresolvable citation: a SHA outside this run's window + today (an older
+ *     commit), an abbreviation shorter than 7, one ambiguous across the pool, or a run glued to a
+ *     letter or digit (`g0d741d9`, git-describe's suffix) resolves to nothing.
+ *   - OVER-MARKING, by construction: the key is a PATH, not a class of change. A suggestion to RUN the
+ *     suite on a commit under `quant_stocks/` is marked exactly like one to wire a graduation gate,
+ *     because both cite gate-path commits — on days 49-64, five of the seven marks ask to add a test
+ *     or run something and confirm (days 56, 57, 62, 63, 64). So the marker text says only what the key
+ *     established ("cites a commit on a configured verdict path"), never that the work is gate-class.
+ *   - OVER-MARKING, mixed and bookkeeping commits: ANY file of the cited commit under a prefix marks
+ *     it, so a cross-lane sweep touching one quant file marks a suggestion about another lane. None
+ *     on days 49-64; on the whole archive, day 31's `20d5300` (per-lane `.vscode/settings.json` across
+ *     three lanes plus `quant_stocks/STATE.md`, cited by a suggestion about editor setup) is one.
+ *     Bookkeeping commits are the same class: the nightly autolog's status-sync commits touch
+ *     `quant_stocks/STATE.md` (9 of 19 between 08-14 and 09-18), so a suggestion citing one is marked.
+ *     NOT special-cased: the marker claims only that the cited commit touches the path, which is true
+ *     of those too. Any-file rather than all-files because the guardrail is "anywhere under" the path,
+ *     and a missed gate costs more than an extra flag.
+ * Never removes, reorders or re-words a suggestion — the returned array is the input with at most a
+ * field added. `renamedFrom` counts: a rename OUT of a verdict path touched it.
+ */
+export function markVerdictPathSuggestions<T extends { text: string; verdictPath?: true }>(
+  suggestions: T[], commits: readonly Activity[], prefixes: readonly string[],
+): T[] {
+  if (!prefixes.length) return suggestions;
+  const pool = commits.filter((a) => a.kind === "commit" && typeof a.event_id === "string");
+  // CASE-INSENSITIVE (IN-2 cold review, lenses 1 and 3): git records a path's exact case, but on this
+  // platform's default case-insensitive filesystem `Quant_Stocks/` and `quant_stocks/` ARE the same
+  // directory, so a wrong-case entry was a marker that silently never fired. The price is an extra mark
+  // where two directories differ only in case — the cheaper error, by the same asymmetry that makes
+  // this rule any-file. `f === p` is kept: a configured FILE path, or a submodule's gitlink path.
+  const lower = prefixes.map((p) => p.toLowerCase());
+  const under = (f: string) => { const x = f.toLowerCase(); return lower.some((p) => x === p || x.startsWith(`${p}/`)); };
+  const touches = (a: Activity) => (a.meta?.diffstat ?? [])
+    .some((d) => under(d.file) || (d.renamedFrom !== undefined && under(d.renamedFrom)));
+  return suggestions.map((s) => {
+    const cited = [...s.text.matchAll(CITED_SHA)].map((m) => m[0]);
+    const marked = cited.some((t) => {
+      // EXACTLY one, the `recapCoverage` / `clusterRecap` uniqueness rule: an ambiguous prefix
+      // "cannot tell", and a marker we cannot justify is one we do not render.
+      const hits = pool.filter((a) => shaPrefixMatch(a.event_id!, t));
+      return hits.length === 1 && touches(hits[0]!);
+    });
+    return marked ? { ...s, verdictPath: true as const } : s;
+  });
+}
+
 export async function workingTreeDriftWarnings(
   uncommitted: Activity[], repoPaths: string[],
   statusNow: (repo: string) => Promise<string> = uncommittedFileList,
+  contributing: string[] = repoPaths,
 ): Promise<string[]> {
-  return driftWarnings(await computeWorkingTreeDrift(uncommitted, repoPaths, statusNow));
+  return driftWarnings(await computeWorkingTreeDrift(uncommitted, repoPaths, statusNow, contributing));
 }
 
 // A run must NOT stamp the day (retryable) when it produced nothing AND at least one repo we
@@ -377,13 +748,31 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   warnings.push(...(deps.preWarnings ?? [])); // shell-supplied (e.g. floor.warning), BEFORE the empty return so it reaches the struct
   // Resolve the probe hosts ONCE, up front — so a malformed-networkProbeHosts warning lands in the
   // (possibly empty) struct exactly as production run() surfaced it, before the empty/blocked return.
-  const { hosts: probeHosts, warning: probeWarning } = resolveProbeHosts(cfg.networkProbeHosts);
+  // A3/T9: the FALLBACK is derived from the API endpoint when the config names no hosts — probing the
+  // endpoint the run will actually use catches DNS failure, a blocking proxy and a down gateway, none
+  // of which anycast sees, and a LOOPBACK endpoint disables the gate so a user on a plane with a local
+  // model does not wait 25s for two unreachable hosts before every briefing. `undefined` from the
+  // derivation means "no opinion" (an unparseable endpoint), which keeps the anycast default rather
+  // than silently disabling the gate on a typo. An explicit config value, `[]` included, still wins.
+  const { hosts: probeHosts, warning: probeWarning } = resolveProbeHosts(
+    cfg.networkProbeHosts,
+    (cfg.provider.api !== undefined ? deriveProbeHosts(cfg.provider.api) : undefined) ?? DEFAULT_NETWORK_PROBE_HOSTS,
+  );
   if (probeWarning) warnings.push(probeWarning);
   // §3.6 requires a malformed `transcripts` block to degrade "with a config-blaming warning" at the
   // consumer boundary. Found at C1 with no reader at all: config.ts produced this warning and nothing
   // consumed it, which is the same defect class as a DropReason with no writer.
   const tx = resolveTranscripts(cfg.transcripts, homedir());
   if (tx.warning) warnings.push(tx.warning);
+  // IN-2: resolved up front for the same reason — a malformed `verdictPaths` warning must reach the
+  // struct on every path, the empty-window one included, even though only the success path marks.
+  const verdict = resolveVerdictPaths(cfg.verdictPaths);
+  if (verdict.warning) warnings.push(verdict.warning);
+  // Tier B (spec §4.8): the SECOND of `resolveRecapCampaigns`' two call sites (the first is `main.ts`'s
+  // lock), on the same raw key, so the two cannot disagree. Resolved up front with the same reasoning as
+  // `verdictPaths`: a malformed key's warning reaches the struct on every path, and B stays `off`.
+  const recapCfg = resolveRecapCampaigns(cfg.recapCampaigns);
+  if (recapCfg.warning) warnings.push(recapCfg.warning);
   // A4 — transcripts require a claude-shaped CLI, as PRODUCT SCOPE (transcript support is for Claude
   // Code users). The predicate is a filename check and cannot see a proxy; that residual is stated in
   // §3.4, not solved here. A silent no-op would be the worse failure: the user enabled a feature and
@@ -415,8 +804,13 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // "resume the review". Labeled by the merge's first-parent file plurality (mergeLabel above; bare
   // repo on tie/no-files) and, like the rest of "today so far", rendered deterministically and never
   // sent to the LLM.
+  // ⚠ THE BRANCH IS SHOWN THROUGH STAGE 2's FAIL-CLOSED DECISION (`branchWords`, #567): a branch carrying
+  // a known-shaped credential in ANY case renders as `[redacted]`. The case-sensitive pass the briefing
+  // and envelope get downstream misses a lower-cased one (`fix/akia…`), which this line used to print
+  // raw while the Stage-2 record of the same merge redacted it. Only the PRINTED lines change: the
+  // prompt's suppress subject below keeps the raw branch, like every other raw subject sent there.
   for (const m of mergedToday) {
-    today.push({ repo: mergeLabel(m), text: `🔀 Merged #${m.prNum} (${m.branch}) (${(m.sha ?? "").slice(0, 7)})` });
+    today.push({ repo: mergeLabel(m), text: `🔀 Merged #${m.prNum} (${shownBranch(m.branch)}) (${(m.sha ?? "").slice(0, 7)})` });
   }
   // In-window PR landings (defect D — EVAL day 33, user-directed): same deterministic treatment,
   // rendered as dated lines at the foot of "What you did" (render.ts). Dated like recap bullets —
@@ -427,7 +821,7 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   const windowMergeLines = windowMerges.map((m) => {
     const d = new Date(m.timestamp ?? 0);
     const dateTag = isNaN(d.getTime()) ? "" : ` (${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })})`;
-    return { repo: mergeLabel(m), text: `🔀 Merged #${m.prNum} (${m.branch})${dateTag}  (${(m.sha ?? "").slice(0, 7)})` };
+    return { repo: mergeLabel(m), text: `🔀 Merged #${m.prNum} (${shownBranch(m.branch)})${dateTag}  (${(m.sha ?? "").slice(0, 7)})` };
   });
 
   // SHA-free suppress-context for the prompt (design 2026-07-19): raw subjects + a whenMs sort key so
@@ -507,7 +901,19 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // Validated HERE, not in validateConfig: a malformed list disables failover with a warning the user
   // can see, rather than throwing (which would cost the briefing every tick) or silently stripping
   // (which would destroy the diagnostic). Same shape as resolveTranscripts above.
-  const acc = resolveAccounts(cfg.provider.accounts, homedir());
+  // A3/T7(b): an API provider sits OUTSIDE the accounts ladder. An `accounts` entry is
+  // `{label, configDir}` where configDir is literally a CLAUDE_CONFIG_DIR handed to a spawned child —
+  // there is no HTTP analogue, and multi-key API failover is a different config shape and a different
+  // slice. So the list is treated as ABSENT here, which makes `resolveAccount` return the single
+  // implicit account. The user is told rather than left to wonder: `buildProvider` hands the ignored
+  // list to the key ladder, which raises the "does not apply to an API provider" warning into the
+  // provider's runtimeWarnings — the same channel every other provider-side warning uses.
+  //
+  // ⚠ ONLY the LADDER is skipped, not the limit machinery. A credit-exhausted API key still throws
+  // `usage-limit`, still records against the implicit label, still takes the quiet `return 0` skip and
+  // still produces the recovery outage line — that half is genuinely transport-agnostic and is the one
+  // failure mode API users will actually hit.
+  const acc = resolveAccounts(cfg.provider.api !== undefined ? undefined : cfg.provider.accounts, homedir());
   for (const w of acc.warnings) warnings.push(w);
   const accountState = await loadAccountState();
   const account = resolveAccount(acc.accounts, accountState, clockNow());
@@ -545,11 +951,40 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // that variable also resolves the transcript scan root (config.ts resolveTranscripts), so exporting
   // it would silently point transcript discovery at the fallback's directory on exactly the days
   // failover engages, with claudeShaped still passing and nothing warning.
-  const hardened = deps.provider ? undefined : hardenedProvider(cfg.provider, {
-    timeoutMs: cfg.provider.timeoutMs,
-    ...(account.configDir !== undefined ? { env: { CLAUDE_CONFIG_DIR: account.configDir } } : {}),
-  }); // #8: honor the config timeout knob
-  const provider: Provider = deps.provider ?? hardened!;
+  // ⚠ A3/T7 — THE OVERLOADED LOCAL, SPLIT. Until this slice one local named `hardened` meant TWO
+  // different things at once, and they were the same thing only because the CLI was the only transport:
+  //
+  //   "WE OWN THE TRANSPORT (it is not deps.provider)"  → gates limit recording, recordAuthProbe and
+  //                                                       clearMark, i.e. every WRITE to live state.
+  //   "WE HAVE LADDER MEMBERS"                          → gates withHardeningLadder.
+  //
+  // An API provider is OWNED but has NO LADDER, so the two meanings diverge and a single local must
+  // answer one of the two questions wrongly. Both wrong answers are silent:
+  //   • using the ladder meaning for the recording gates DROPS limit recording for every API run — an
+  //     outage with no mark, no quiet skip and no recovery line;
+  //   • using the ownership meaning for the ladder branch feeds `withHardeningLadder` a provider with
+  //     no `hardeningActive`/`probeWithoutHardening`, which is a TypeError on the failure path.
+  // Hence two explicit locals, each used for exactly one question. The comments at each of the four
+  // sites below name WHICH question they are asking, because the old comments justified the conflated
+  // form and would have read as approval of either meaning.
+  const owned = deps.provider === undefined;
+  const built = owned
+    ? buildProvider(cfg.provider, {
+        timeoutMs: cfg.provider.timeoutMs,          // #8: honor the config timeout knob (both transports)
+        // CLAUDE_CONFIG_DIR selects a CLI LOGIN DIRECTORY. It is passed as a PER-SPAWN env option and
+        // must never be written to process.env (it also resolves the transcript scan root). For an API
+        // provider there is no spawn and no login directory, and `account` is the implicit one by
+        // construction (see resolveAccounts above), so this branch cannot be reached with a configDir —
+        // the guard is spelled out anyway so the invariant is local rather than three screens away.
+        ...(cfg.provider.api === undefined && account.configDir !== undefined
+          ? { env: { CLAUDE_CONFIG_DIR: account.configDir } }
+          : {}),
+      })
+    : undefined;
+  /** Ladder members, or undefined for an API provider AND for an injected one. Answers ONLY the
+   *  "is there a hardening ladder to run" question. */
+  const laddered: HardenedProvider | undefined = built?.laddered;
+  const provider: Provider = deps.provider ?? built!.provider;
   const delays = deps.retryDelaysMs ?? PROVIDER_RETRY_DELAYS_MS;
 
   // Gate the provider call on real connectivity (bounded). A scheduled (non-forced) run still offline
@@ -629,15 +1064,21 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // re-running the whole retry schedule per rung would cost 9 provider calls and ~10 minutes rather than
   // the intended worst case of 5 calls.
   const attempt = () => generateBriefing(ctx, capturing, {
-    date: runDate, machineScope: hostname(), provider: cfg.provider.cli, warnings, today, windowMerges: windowMergeLines, stateAsOf, morningFloor, todaySuppress,
+    // A3/T10: `providerLabel` returns `cfg.cli` VERBATIM for a CLI run — existing briefing headers are
+    // byte-identical — and `<label> (<model>)` for an API run, because the model is the provenance fact
+    // that changes briefing content and the header is where a reader would look for it.
+    date: runDate, machineScope: hostname(), provider: providerLabel(cfg.provider), warnings, today, windowMerges: windowMergeLines, stateAsOf, morningFloor, todaySuppress,
   }, units, rootsByRepo);
   try {
     // The ladder wraps the withRetry CALL (C1/B6): it only acts once the schedule is exhausted, which is
     // what moves the "a network failure looks like a usage error" window from t~0.09s — peak
     // wake-before-wifi hazard — out to t~135s. A plain `Provider` (an injected test double) has no
     // ladder members, so it runs unwrapped.
-    struct = hardened
-      ? await withHardeningLadder(hardened, () => withRetry(attempt, delays, deps.sleep), attempt, cfg.provider.timeoutMs)
+    // LADDER question. `laddered`, not `owned`: an API provider is owned but has nothing to back off
+    // from — no flags were injected, so "would it have worked without our flags?" has no meaning, and
+    // the ladder's rungs would cost two extra HTTP calls per tick to answer it.
+    struct = laddered
+      ? await withHardeningLadder(laddered, () => withRetry(attempt, delays, deps.sleep), attempt, cfg.provider.timeoutMs)
       : await withRetry(attempt, delays, deps.sleep);
   } catch (e) {
     if (e instanceof Error) {
@@ -651,14 +1092,26 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     // same quiet path as the offline/darkwake skips. This tick produces no briefing — the cost of
     // resolving the account before the call — and the next provider-calling tick selects the fallback.
     //
-    // ⚠ Recording is gated on `hardened` being defined, i.e. on THIS run having built the provider and
-    // resolved the account. An injected `deps.provider` means the caller supplied the transport: the
-    // eval harness runs the real pipeline through runCore that way (src/eval/run-case.ts), so recording
-    // here would let a developer's eval write a mark — and a reportable outage — into the user's live
-    // state. Tests inject the same way.
-    if (e instanceof ProviderError && e.code === "usage-limit" && hardened) {
+    // ⚠ OWNERSHIP question — `owned`, NOT `laddered`. Recording is gated on THIS run having built the
+    // provider and resolved the account. An injected `deps.provider` means the caller supplied the
+    // transport: the eval harness runs the real pipeline through runCore that way (src/eval/run-case.ts),
+    // so recording here would let a developer's eval write a mark — and a reportable outage — into the
+    // user's live state. Tests inject the same way.
+    // ⚠ A3: gating this on `laddered` instead would silently DROP limit recording for every API run,
+    // which is the exact failure the split exists to prevent — an API key that hits its wall would
+    // produce a bare error line every 600s with no mark, no quiet skip and no recovery report.
+    if (e instanceof ProviderError && e.code === "usage-limit" && owned) {
       const now = clockNow();
-      const reset = parseResetInstant(e.message, now);
+      // A3: prefer the STRUCTURED reset a transport supplies over text-matching an English CLI
+      // sentence. `parseResetInstant` falls back to a one-hour PROBE mark when it cannot read one, so
+      // an HTTP `retry-after` (or a spend-cap body naming its resume instant) would otherwise be
+      // downgraded to a guess we already have the real answer for. The CLI path never sets `resetAt`,
+      // so its behaviour here is byte-identical to before. A malformed value falls back rather than
+      // producing an Invalid Date that would serialize as null into live state.
+      const fromError = e.resetAt !== undefined && !Number.isNaN(Date.parse(e.resetAt))
+        ? { until: new Date(e.resetAt), isProbe: false }
+        : undefined;
+      const reset = fromError ?? parseResetInstant(e.message, now);
       await recordLimit(account.label, reset.until, now, { isProbe: reset.isProbe });
       // Re-resolve against the state AS WRITTEN rather than reasoning about what the mark implies:
       // this is the only honest answer to "is anything left?", and the shell prints one of two
@@ -677,7 +1130,11 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     // the whole outage: ~135s of backoff plus a failure line per tick, strictly worse than the defect
     // this feature exists to fix. A one-hour probe mark backs off without benching it for the week.
     // Never applies to the first entry — see recordAuthProbe.
-    if (e instanceof ProviderError && hardened) await recordAuthProbe(account.label, acc.accounts, clockNow());
+    // OWNERSHIP question again, and for the same reason: this WRITES a probe mark into live state.
+    // Inert for an API provider in practice — `recordAuthProbe` never applies to the first entry and an
+    // API run always has exactly the single implicit account — so the gate is about the injected-provider
+    // case, which is the one that must never write.
+    if (e instanceof ProviderError && owned) await recordAuthProbe(account.label, acc.accounts, clockNow());
     throw e;
   }
   // The SUCCESS struct comes from generateBriefing, not from mkStruct — so it needs the outage attached
@@ -688,12 +1145,25 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
 
   // Success clears ONLY this account's mark — clearing broadly would erase a walled account's mark the
   // moment the fallback succeeds, so the next tick would retry the wall and stickiness would be gone.
-  if (hardened) await clearMark(account.label);
+  // OWNERSHIP question. A successful API run must clear its own mark, or a wall recorded yesterday
+  // would keep benching the implicit label after the credit was topped up.
+  if (owned) await clearMark(account.label);
 
   // Volatile-state re-check just before returning (see workingTreeDriftWarnings) — merged into the
   // struct's own warnings (surfaced in the rendered briefing), not the pipeline `warnings` the shell prints.
+  // ⚠ THE clean→dirty SCAN SET IS NARROWER THAN `repos`, on two counts (round-2 review):
+  //   - a repo classified INACCESSIBLE at discovery or extraction can contribute no trustworthy
+  //     measurement — extraction already skipped it (`readable`, extractor.ts) — so re-probing it
+  //     here only buys a fresh `git status` bounded by GIT_TIMEOUT_MS (30s) per repo, paid at the
+  //     very end of the run, after the model call and immediately before the briefing is written;
+  //   - a repo that produced NO briefing content has no "Where you left off" for the advisory to
+  //     point at (see computeWorkingTreeDrift's header for why the two directions differ).
+  // `units` is the resolved set that produced content. The dirty→clean direction is unaffected: it
+  // keys off the uncommitted activities below, which is the wider audience it needs.
+  const inaccessible = new Set([...discIssues, ...extrIssues].map((i) => i.path));
+  const contributing = [...new Set(units.map((u) => u.repo))].filter((r) => !inaccessible.has(r));
   const drifts = await computeWorkingTreeDrift(
-    activities.filter((a) => a.kind === "uncommitted"), repos, deps.statusNow);
+    activities.filter((a) => a.kind === "uncommitted"), repos, deps.statusNow, contributing);
   const drift = driftWarnings(drifts);
   // C1/B8: merge the provider's dynamic warnings here, EXPLICITLY. They are only known during
   // generate(), i.e. after the pipeline `warnings` list above was assembled — and pushing onto that
@@ -833,12 +1303,79 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // below pins this.
   struct.suggestions = annotateStaleSuggestions(struct.suggestions, drifts);
 
+  // ── IN-10: PERSISTING STASHES → ONE CODE-BUILT SUGGESTION, APPENDED LAST (see `stashSuggestions`).
+  // AFTER `annotateStaleSuggestions`, so the drift annotation can never append to the fixed text whose
+  // token count keeps the counted restatement rule unable to fire; BEFORE the IN-2 marker and the
+  // postcheck block, so both grade the list that ships. From the RAW activities, like `branchState`
+  // below. No stash qualifying ⇒ nothing appended and the list is shaped exactly as before.
+  const stashLines = stashSuggestions(activities, repos, units, struct.suggestions, runDate);
+  if (stashLines.length) struct.suggestions = [...struct.suggestions, ...stashLines];
+
   // Day-21: branch state, CODE-RENDERED into "Where you left off". Computed from the raw activities
   // (not the reduced copies) so a budget trim can never drop it. Left ABSENT rather than set to an
   // empty array when no repo has anything worth saying — render treats both identically, and the
   // struct stays free of empty keys.
   const bs = branchStateLines(activities, repos);
   if (bs.length) struct.branchState = bs;
+
+  // ── SUB-PROJECT LABEL LEGEND (judge days 41/43/44). Deterministic, code-built from `Unit.root` —
+  // the ONLY place the label→parent-repo containment relation exists — and attached here, ABOVE the
+  // postcheck block, per that block's "place any new struct writer above this" rule. Assigned only
+  // when non-empty so a single-project install's struct is shaped exactly as before (render then
+  // emits nothing and its briefing is byte-identical).
+  const legend = subprojectLegend(units, repos);
+  if (legend.length) struct.labelLegend = legend;
+
+  // ── IN-2: VERDICT-PATH MARKER (EVAL days 51/52). A struct writer, so ABOVE the postcheck block per
+  // its rule. AFTER `annotateStaleSuggestions`, the last writer of suggestion text, and after the IN-10
+  // stash append (the last writer of the list), so the key reads the text that ships — a stash line is
+  // hex-free by construction and never marks. Keyed on the RAW activities (window + today, bot commits excluded — the same
+  // population the model's evidence could have come from), not the reduced ctx: a budget trim drops
+  // diffstat detail, and the marker must not vanish on a heavy morning — the reasoning `branchState`
+  // gives above. With `verdictPaths` unset, `verdict.paths` is `[]` and this returns the array
+  // untouched — no field, no line, byte-identical.
+  struct.suggestions = markVerdictPathSuggestions(struct.suggestions, [...realActivities, ...realTodayActs], verdict.paths);
+
+  // ── TIER B (Stage-2 recap campaigns), spec §4.2: its ONE slot — after the last struct writer above the
+  // postcheck block (the IN-2 marker just above), and therefore after the provider-warning fold
+  // (`const late = [...drift, ...runtimeWarningsOf(provider)]`, further up), so `recap` and its `group`
+  // stamps are final and nothing reads the provider's `runtimeWarnings` again: B's own call's warnings
+  // go to its record, never onto the page, in any outcome. `off` is decided HERE (§4.1 step 1: B does
+  // nothing at all — no gate, no git read, no call, no record, no stderr line); the phase is never called
+  // with it. Never inside `generateBriefing` (the retried unit) and never through `capturing` (its
+  // prompt/raw text are the main call's).
+  if (recapCfg.mode !== "off") {
+    const commitActs = ctx.repos.flatMap((r) => r.activities).filter((a) => a.kind === "commit");
+    const res = await runRecapCampaignsPhase({
+      mode: recapCfg.mode,
+      struct,
+      gateCommits: commitActs.length,
+      // `clusterRecap`'s own population (generator.ts:929) — the commits Stage 1 resolved against.
+      ctxCommits: commitActs.filter((a) => typeof a.event_id === "string"),
+      unitLabels: units.map((u) => u.label),
+      repoLabels: repos.map((r) => repoLabelFor(r, repos)),
+      windowStart: new Date(windowStartUtc),
+      clockNow,
+      runDate,
+      force,
+      invocation: deps.recapInvocation,
+      // The RESOLVED grouper (§4.1 step 2): production reuses the run's own provider instance — no second
+      // construction; an injected `deps.provider` with no `deps.grouper` resolves to none.
+      grouper: deps.grouper ?? (owned ? (p: string) => built!.provider.generate(p) : undefined),
+      warningsOf: () => runtimeWarningsOf(provider),
+      hardeningOf: () => (laddered ? (laddered.hardeningActive() ? "on" : "off") : "n/a"),
+      timeoutMs: cfg.provider.timeoutMs ?? TIMEOUT_MS,
+      persist: deps.persistRecapRecord ?? ((line: string) => appendFile(recapCampaignsPath(), line + "\n")),
+      seams: { callDeadlineMs: deps.recapCallDeadlineMs, gitBudgetMs: deps.recapGitBudgetMs, impl: deps.recapImpl },
+    });
+    // Step 12, and the ONLY struct write B makes: `applied` (mode `on`, every check passed) returns the
+    // candidate's `recap`; every other outcome returns nothing and the page is Stage 1's.
+    if (res.recap) struct.recap = res.recap;
+  }
+  // ⚠ AFTER-SLOT INVARIANT (spec §4.2): no struct writer below this line may read `struct.recap`. The one
+  // writer below — the transcript-health notices (`struct.warnings`, after the postcheck block) — reads
+  // the health record, never `recap`, and adds the same line whether or not B applied, so every relation
+  // live checks (a)–(f) certified still holds on the delivered page (pinned at delivery by [TB-P6]).
 
   // ── OUTPUT-SIDE CHECKS (postcheck). MOVED HERE from `generateBriefing` on 2026-08-11 — see the
   // tombstone there for the defect. This is the first point at which `struct` is genuinely final:
@@ -873,6 +1410,17 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
   // ⚠ WRAPPED, and not as defensive boilerplate — it is this file's own rule for anything
   // observational on the delivery path (the eval layer above is guarded the same way). A DIAGNOSTIC
   // that can abort the 07:20 briefing is strictly worse than one that misses a finding.
+  //
+  // ⚠ TWO `try`s, NOT ONE (IN-4 review round 1). The COUNTED checks (freshness, restatement) and the
+  // INFO-ONLY S3 counter used to share one block, so a throw anywhere in S3 erased that morning's
+  // COUNTED rows too — measured: counted 1 → 0 with an injected throw. An info-only diagnostic must
+  // never be able to delete a counted one, so S3 now runs in its own block AFTER the counted rows are
+  // printed. Output order is unchanged (counted checks first, S3 last, as before). ONE print template
+  // for both blocks, so the `postcheck` / `postcheck-info` split cannot drift between them.
+  // The converse also changed, and it is the one reading it moves: if the COUNTED block throws, the S3
+  // info rows now still print (before, they were lost with it). That touches only row 34's aggregate
+  // `grep -c "postcheck-info"` reading, and only on such a morning; `grep -c "postcheck \["` cannot move.
+  const printPostFinding = (p: PostFinding) => diagError(`${p.info ? "postcheck-info" : "postcheck"} [${p.rule}]: ${p.detail}`);
   try {
     const post = [
       ...checkResumeFreshness(struct.resume, todaySuppress),
@@ -880,9 +1428,56 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     ];
     // `postcheck-info` for telemetry rows: the EVAL convention counts `grep -c "postcheck \["`, and
     // "postcheck-info [" does not match it — near-misses must never move a flag count (thresholds.ts).
-    for (const p of post) console.error(`${p.info ? "postcheck-info" : "postcheck"} [${p.rule}]: ${p.detail}`);
+    // ⚠ `diagError`, NOT `console.error`: every `detail` is built from the model's own suggestion and
+    // resume text or from a git commit subject, and this line goes to stderr → briefing.log → the
+    // desktop app's progress feed. It was the measured leak (2026-09-16) — the briefing was redacted
+    // and its diagnostic was not. The `postcheck` / `postcheck-info` prefixes are OUTSIDE the untrusted
+    // span and unchanged, so the EVAL convention's `grep -c "postcheck \["` count cannot move.
+    for (const p of post) printPostFinding(p);
   } catch (e) {
-    console.error(`postcheck skipped (non-fatal): ${e}`); // never let a diagnostic cost a morning
+    // The throw can carry the same text the details would have — an interpolated struct field lands in
+    // `${e}` just as readily.
+    diagError(`postcheck skipped (non-fatal): ${e}`); // never let a diagnostic cost a morning
+  }
+  try {
+    const volume = [
+      // S3 floor telemetry (INFO-only, never a finding — see checkSuggestionVolume). Reads the same
+      // `units` SET the prompt was built from; `windowCommits` is the non-excluded in-window count,
+      // absent ⇒ 0.
+      //
+      // ⚠ THE UNIT SET IS SHARED; THE COUNTS ARE NOT WHAT THE MODEL SAW. These counts come from
+      // `resolveUnits`, i.e. the FULL activity list, while the prompt is built from the post-`reduce`
+      // ctx — and `reduce` drops activity detail at stage 2 and whole repos at stage 3 under budget
+      // pressure (reduce.ts). So on a trimmed morning this diagnostic can name a unit whose commits
+      // the model was never shown, and "the model ignored the floor" is then the wrong reading. One
+      // more reason it is INFO-only telemetry to accumulate rather than an accusation to act on.
+      //
+      // IN-4: the THIRD argument is the SAME-DAY leg's input — `todayCommits`, the non-excluded commits
+      // "Today so far" renders, counted per unit in `resolveUnits` (git-derived). The model is still fed
+      // same-day subjects only as suppress-context (`todaySuppress`, above), and this leg exists to
+      // measure exactly that; it reads the counts and changes nothing the model sees.
+      ...checkSuggestionVolume(struct.suggestions, units.map((u) => ({ label: u.label, commits: u.windowCommits ?? 0 })),
+        units.map((u) => ({ label: u.label, commits: u.todayCommits ?? 0 }))),
+    ];
+    for (const p of volume) printPostFinding(p);    // every row info:true BY TYPE (PostFinding)
+  } catch (e) {
+    // Same wording as the counted block's, so a reader grepping "postcheck skipped" finds both; it
+    // matches neither `postcheck [` nor `postcheck-info`, so no EVAL count moves on a throw.
+    diagError(`postcheck skipped (non-fatal, S3 volume counter): ${e}`);
+  }
+  // ── RECAP format-drift telemetry (2026-09-22, review round 1 L4). `parseBriefing` now recovers a
+  // bullet whose model dropped the prompt's `| evidence:` pipe, so the eval's G1 `evidence`/`coverage`
+  // checks no longer fail on that drift — scoring unchanged, only its input. This ONE line per briefing
+  // keeps the drift visible: stderr → briefing.log only (same sink as the postcheck rows, never
+  // `struct.warnings`, so the delivered page is byte-identical). Prefix `parse-info`, deliberately
+  // neither `postcheck [` (the EVAL count) nor `postcheck-info` (row 34's aggregate reading), so no
+  // EVAL grep moves. Counted from `rawText` — the final attempt's model output, the text the shipped
+  // struct was parsed from — so a retried morning logs once. Own `try`: it can never cost a morning.
+  try {
+    const drift = countPipelessRecapEvidence(rawText);
+    if (drift.recovered) diagError(`parse-info [recap-evidence-pipeless]: ${drift.recovered} of ${drift.total} recap bullet(s) cited evidence without the prompt's "| evidence:" pipe; recovered by the trailing-form fallback`);
+  } catch (e) {
+    diagError(`parse-info skipped (non-fatal, recap evidence drift): ${e}`);
   }
 
   // ── T4.9: the health-JSON WRITE call site.
@@ -934,10 +1529,12 @@ export async function runCore(cfg: Config, deps: RunDeps, force = false): Promis
     // `?.length` not a truthy test: `resolveAccounts([])` returns an ACCEPTED empty array (no warning),
     // and `effectiveAccounts([])` synthesises "default" — so a truthy test logs `account "default"`
     // every morning for a user who emptied the list to turn the feature off.
-    // Gated on `hardened` for the same reason recordLimit/clearMark/recordAuthProbe are: an injected
+    // OWNERSHIP question, for the same reason recordLimit/clearMark/recordAuthProbe are: an injected
     // `deps.provider` means the resolved label never reached a spawn, so attributing the output to it
     // would be a claim about a process that never ran. The eval harness calls runCore exactly that way.
-    ...(hardened && acc.accounts?.length ? { account: account.label } : {}),
+    // ⚠ A3: `acc.accounts` is forced to undefined for an API provider (see resolveAccounts above), so
+    // this stays absent on an API run — which is correct, because there was no account CHOICE to record.
+    ...(owned && acc.accounts?.length ? { account: account.label } : {}),
     // Purely ADDITIVE, for the eval harness's G7 (`recency`). Exposing the list rather than letting
     // the harness rebuild it from `today` is deliberate: `todaySuppress` carries the resolved unit
     // LABEL (unitForCommit + repoLabelFor) and the merge-derived entries, and a second derivation of

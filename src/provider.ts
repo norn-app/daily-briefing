@@ -2,9 +2,14 @@
 import type { Provider, Config } from "./types";
 import { ProviderError } from "./types";
 import { drain, raceFlush, sinkText } from "./stream";
+import { redactCredentials } from "./transcripts/credentials";
 
 export const TIMEOUT_MS = 120_000;
-const KILL_GRACE_MS = 5_000;   // SIGTERM → this long → SIGKILL (a TERM-ignoring child can't hang the run)
+/** SIGTERM → this long → SIGKILL (a TERM-ignoring child can't hang the run).
+ *  EXPORTED because `runlock.ts` derives its staleness window from the holder's real worst case, and
+ *  a single attempt's true ceiling is `timeoutMs + KILL_GRACE_MS`, not `timeoutMs`. Importing it there
+ *  rather than re-spelling 5_000 is what keeps the two from drifting — see `lockStaleMs`. */
+export const KILL_GRACE_MS = 5_000;
 // After exit, bounded wait for the stream reads — a grandchild that inherited the pipes can hold
 // them open forever, so the reads must never be awaited unconditionally. Two tiers: after a KILL the
 // output is discarded anyway (short); after a NORMAL exit be generous — a slow post-wake flush must
@@ -369,9 +374,12 @@ export class BYOCliProvider implements Provider {
       // is set — so a stderr-preferred diag rendered a blank "claude exited 1:" for the 2026-07-11
       // launchd failure, and an "only if stderr is empty" fallback never fires on the machines that
       // most need it. Include both, tagged, so neither cause is thrown away.
+      // REDACT, THEN CLIP. The 300-char cut used to come first, so a credential straddling it lost its
+      // tail — and a prefix too short for its pattern (`ghp_` + 12 chars) escaped every later redaction
+      // pass (the envelope, last-skip, briefing.log) while still being most of a secret.
       const parts: string[] = [];
-      if (err.trim()) parts.push(err.slice(0, 300));
-      if (out.trim()) parts.push(`(stdout) ${out.slice(0, 300)}`);
+      if (err.trim()) parts.push(redactCredentials(err).slice(0, 300));
+      if (out.trim()) parts.push(`(stdout) ${redactCredentials(out).slice(0, 300)}`);
       const diag = parts.length ? parts.join(" | ") : "(no output)";
       // A subscription usage wall (weekly or session) is not a transient failure: retrying cannot
       // succeed until the reset, so it is classified separately and treated as PERMANENT by both

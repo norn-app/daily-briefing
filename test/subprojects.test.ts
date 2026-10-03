@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rootOf } from "../src/subprojects";
 import type { Config } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const CFG: Config = { provider: { cli: "c", argv: [], promptVia: "stdin" } };
 
@@ -23,7 +24,7 @@ test("rootOf: no match → null", () => {
 
 test("expandRoots: '*' → immediate dirs, excludes node_modules/.git/submodules", async () => {
   const { expandRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-exp-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-exp-")));
   for (const d of ["pkg-a", "pkg-b", "node_modules", ".hidden"]) mkdirSync(join(root, d), { recursive: true });
   mkdirSync(join(root, "sub", ".git"), { recursive: true }); // a submodule/nested repo
   const roots = (await expandRoots(root, ["*"])).sort();
@@ -31,20 +32,20 @@ test("expandRoots: '*' → immediate dirs, excludes node_modules/.git/submodules
 });
 test("expandRoots: '!'-negation excludes a matched dir", async () => {
   const { expandRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-exp2-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-exp2-")));
   for (const d of ["packages/api", "packages/web"]) mkdirSync(join(root, d), { recursive: true });
   const roots = (await expandRoots(root, ["packages/*", "!packages/web"])).sort();
   expect(roots).toEqual(["packages/api"]);
 });
 test("expandRoots: leading './' is tolerated", async () => {
   const { expandRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-exp3-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-exp3-")));
   mkdirSync(join(root, "app"), { recursive: true });
   expect(await expandRoots(root, ["./app"])).toEqual(["app"]);
 });
 test("expandRoots: recursive glob excludes node_modules at ANY depth (segment-wise skip)", async () => {
   const { expandRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-exp4-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-exp4-")));
   mkdirSync(join(root, "packages/api"), { recursive: true });
   mkdirSync(join(root, "packages/node_modules/vendor"), { recursive: true });
   const roots = await expandRoots(root, ["packages/**"]);
@@ -54,31 +55,31 @@ test("expandRoots: recursive glob excludes node_modules at ANY depth (segment-wi
 
 test("detectJs: package.json array-form workspaces", async () => {
   const { detectJs } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-js-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-js-")));
   writeFileSync(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
   expect(await detectJs(root)).toEqual(["packages/*"]);
 });
 test("detectJs: Yarn-classic object-form workspaces", async () => {
   const { detectJs } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-js2-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-js2-")));
   writeFileSync(join(root, "package.json"), JSON.stringify({ workspaces: { packages: ["apps/*"] } }));
   expect(await detectJs(root)).toEqual(["apps/*"]);
 });
 test("detectJs: pnpm-workspace.yaml", async () => {
   const { detectJs } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-js3-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-js3-")));
   writeFileSync(join(root, "pnpm-workspace.yaml"), "packages:\n  - './libs/*'\n");
   expect(await detectJs(root)).toEqual(["libs/*"]);
 });
 test("detectRust: Cargo [workspace].members minus exclude", async () => {
   const { detectRust } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-rs-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-rs-")));
   writeFileSync(join(root, "Cargo.toml"), `[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/legacy"]\n`);
   expect(await detectRust(root)).toEqual(["crates/*", "!crates/legacy"]);
 });
 test("detectJs: null when no JS manifest", async () => {
   const { detectJs } = await import("../src/subprojects");
-  expect(await detectJs(mkdtempSync(join(tmpdir(), "dba-js4-")))).toBeNull();
+  expect(await detectJs(removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-js4-"))))).toBeNull();
 });
 
 test("parseGoWork: single-line + block use, comments, quotes, ./ strip; ignores replace/require", async () => {
@@ -96,7 +97,7 @@ test("parseGoWork: single-line + block use, comments, quotes, ./ strip; ignores 
 });
 test("resolveProjectRoots: a repo with no go.work contributes no go-derived roots or warnings", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-go2-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-go2-")));
   const { roots, warnings } = await resolveProjectRoots(root, CFG);
   expect(roots).toEqual([]);
   expect(warnings).toEqual([]);
@@ -104,7 +105,7 @@ test("resolveProjectRoots: a repo with no go.work contributes no go-derived root
 
 test("resolveProjectRoots: config replaces detection", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-rpr-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-rpr-")));
   mkdirSync(join(root, "a"), { recursive: true });
   writeFileSync(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
   const cfg: Config = { ...CFG, subprojects: [{ repo: root, roots: ["*"] }] };
@@ -113,7 +114,7 @@ test("resolveProjectRoots: config replaces detection", async () => {
 });
 test("resolveProjectRoots: polyglot Cargo + go.work → union", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-poly-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-poly-")));
   mkdirSync(join(root, "crates/core"), { recursive: true });
   mkdirSync(join(root, "gomod"), { recursive: true });
   writeFileSync(join(root, "Cargo.toml"), `[workspace]\nmembers = ["crates/*"]\n`);
@@ -123,7 +124,7 @@ test("resolveProjectRoots: polyglot Cargo + go.work → union", async () => {
 });
 test("resolveProjectRoots: non-empty roots resolving to zero dirs → warn", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-warn-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-warn-")));
   const cfg: Config = { ...CFG, subprojects: [{ repo: root, roots: ["packages/*"] }] };
   const { roots, warnings } = await resolveProjectRoots(root, cfg);
   expect(roots).toEqual([]);
@@ -131,7 +132,7 @@ test("resolveProjectRoots: non-empty roots resolving to zero dirs → warn", asy
 });
 test("resolveProjectRoots: auto-detected manifest whose roots resolve to zero directories → warn (no config, detection branch)", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-autozero-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-autozero-")));
   writeFileSync(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
   // packages/ contains only a nested-git-repo dir → expandRoots' hasGitEntry skip excludes it,
   // yielding zero net directories even though a manifest WAS found (non-empty globs).
@@ -142,7 +143,7 @@ test("resolveProjectRoots: auto-detected manifest whose roots resolve to zero di
 });
 test("resolveProjectRoots: explicit roots:[] → single-unit, no warn", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-empty-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-empty-")));
   writeFileSync(join(root, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }));
   const cfg: Config = { ...CFG, subprojects: [{ repo: root, roots: [] }] };
   const { roots, warnings } = await resolveProjectRoots(root, cfg);
@@ -151,7 +152,7 @@ test("resolveProjectRoots: explicit roots:[] → single-unit, no warn", async ()
 });
 test("resolveProjectRoots: malformed manifest → warning, no crash", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-bad-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-bad-")));
   writeFileSync(join(root, "Cargo.toml"), "[workspace]\nmembers = [unterminated"); // genuinely-invalid TOML (unterminated array)
   const { roots, warnings } = await resolveProjectRoots(root, CFG);
   expect(roots).toEqual([]);
@@ -159,7 +160,7 @@ test("resolveProjectRoots: malformed manifest → warning, no crash", async () =
 });
 test("resolveProjectRoots: Cargo [workspace].exclude drops the excluded member end-to-end", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-cargoex-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-cargoex-")));
   for (const d of ["crates/core", "crates/legacy"]) mkdirSync(join(root, d), { recursive: true });
   writeFileSync(join(root, "Cargo.toml"), `[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/legacy"]\n`);
   const { roots } = await resolveProjectRoots(root, CFG);
@@ -168,7 +169,7 @@ test("resolveProjectRoots: Cargo [workspace].exclude drops the excluded member e
 });
 test("resolveProjectRoots: go.work 'use ../shared' → skipped + warned", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-esc-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-esc-")));
   mkdirSync(join(root, "in"), { recursive: true });
   writeFileSync(join(root, "go.work"), "use ./in\nuse ../shared\n");
   const { roots, warnings } = await resolveProjectRoots(root, CFG);
@@ -177,7 +178,7 @@ test("resolveProjectRoots: go.work 'use ../shared' → skipped + warned", async 
 });
 test("resolveProjectRoots: go.work with ONLY escaping use dirs → roots [] but STILL warned (early-return ordering)", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const root = mkdtempSync(join(tmpdir(), "dba-allesc-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-allesc-")));
   writeFileSync(join(root, "go.work"), "use ../shared\nuse ../../other\n"); // zero net globs — must still warn
   const { roots, warnings } = await resolveProjectRoots(root, CFG);
   expect(roots).toEqual([]);
@@ -220,20 +221,17 @@ const commit = (files: string[]): Activity => ({
   source: "git", kind: "commit", event_id: "x", meta: { diffstat: files.map((f) => ({ file: f, added: 1, removed: 0 })) },
 });
 
-test("unitForCommit: plurality bucket", () => {
-  expect(require("../src/subprojects").unitForCommit(commit(["packages/api/a", "packages/api/b", "packages/web/c"]), ["packages/api", "packages/web"])).toBe("packages/api");
-});
-test("unitForCommit: a top-vote tie → catch-all (null), not an arbitrary lex pick", () => {
-  const { unitForCommit } = require("../src/subprojects");
-  // No clear owner (1 file each) → the commit is cross-cutting, so it belongs to the repo catch-all,
-  // NOT arbitrarily to the lexicographically-first root (the old behavior — that caused the day-8 misattribution).
-  expect(unitForCommit(commit(["apps/x/a", "packages/y/b"]), ["apps/x", "packages/y"])).toBeNull();
-});
-test("unitForCommit: cross-cutting infra commit (STATE.md sync spanning sub-projects) → catch-all", () => {
-  const { unitForCommit } = require("../src/subprojects");
+// A top-vote tie → catch-all (null), not an arbitrary lex pick. No clear owner (1 file each) → the
+// commit is cross-cutting, so it belongs to the repo catch-all, NOT arbitrarily to the
+// lexicographically-first root (the old behavior — that caused the day-8 misattribution).
+test.each([
+  ["a top-vote tie between two roots", ["apps/x/a", "packages/y/b"], ["apps/x", "packages/y"]],
   // Mirrors day-8's `8b4e2b9` ("nightly autolog status sync"): accountant_ai/STATE.md + daily_briefing/STATE.md,
   // 1 each → tie → catch-all, NOT [accountant_ai].
-  expect(unitForCommit(commit(["accountant_ai/STATE.md", "daily_briefing/STATE.md"]), ["accountant_ai", "daily_briefing"])).toBeNull();
+  ["cross-cutting infra commit (STATE.md sync spanning sub-projects)", ["accountant_ai/STATE.md", "daily_briefing/STATE.md"], ["accountant_ai", "daily_briefing"]],
+])("unitForCommit: %s → catch-all (null)", (_name, files, roots) => {
+  const { unitForCommit } = require("../src/subprojects");
+  expect(unitForCommit(commit(files), roots)).toBeNull();
 });
 test("unitForCommit: a clear plurality still wins (no over-catch)", () => {
   const { unitForCommit } = require("../src/subprojects");
@@ -246,18 +244,61 @@ test("unitForCommit: all-null → null (catch-all)", () => {
 });
 test("composeResumptionNote: diverged branch shows BOTH numbers + all clauses", () => {
   const { composeResumptionNote } = require("../src/subprojects");
-  expect(composeResumptionNote({ files: ["a.ts"], ahead: 2, behind: 3, stashes: 1, detached: false }))
-    .toBe("uncommitted: a.ts; ahead 2, behind 3; 1 stash(es)");
+  expect(composeResumptionNote({
+    files: ["a.ts"], ahead: 2, behind: 3, detached: false,
+    stashes: [{ text: "stash@{0}: WIP on feat/x: 8cefd59 tweak", timestamp: "2026-08-27T14:00:00-07:00" }],
+  })).toBe("uncommitted: a.ts; ahead 2, behind 3; stash@{0}: WIP on feat/x: 8cefd59 tweak (Aug 27)");
 });
-test("composeResumptionNote: stash-only", () => {
+// ── Stash detail (days 44 + 47, user-approved): branch + message + date, not a bare count ────────
+test("composeResumptionNote: stash-only renders the stash's own text and date — the day-47 clue shape", () => {
   const { composeResumptionNote } = require("../src/subprojects");
-  expect(composeResumptionNote({ files: [], ahead: 0, behind: 0, stashes: 1, detached: false })).toBe("1 stash(es)");
+  // Day 47 verbatim: "1 stash(es)" hid that the stash sat on refactor/one-tenant-definition —
+  // the clue to the morning's orphaned lane. The %gs text carries the branch and message.
+  expect(composeResumptionNote({
+    files: [], ahead: 0, behind: 0, detached: false,
+    stashes: [{ text: "stash@{0}: On refactor/one-tenant-definition: one-tenant sweep", timestamp: "2026-08-27T14:00:00-07:00" }],
+  })).toBe("stash@{0}: On refactor/one-tenant-definition: one-tenant sweep (Aug 27)");
+});
+test("composeResumptionNote: stash cap — first STASH_NOTES_SHOWN in detail, the rest counted", () => {
+  const { composeResumptionNote, STASH_NOTES_SHOWN } = require("../src/subprojects");
+  expect(STASH_NOTES_SHOWN).toBe(2);
+  const stashes = [0, 1, 2, 3].map((n) => ({ text: `stash@{${n}}: WIP on b${n}: m${n}`, timestamp: "2026-08-27T14:00:00-07:00" }));
+  expect(composeResumptionNote({ files: [], ahead: 0, behind: 0, detached: false, stashes }))
+    .toBe("stash@{0}: WIP on b0: m0 (Aug 27); stash@{1}: WIP on b1: m1 (Aug 27); +2 more stash(es)");
+});
+test("composeResumptionNote: a paragraph-length stash message is clipped, a missing/bad date drops the parenthetical", () => {
+  const { composeResumptionNote } = require("../src/subprojects");
+  const long = `stash@{0}: On main: ${"x".repeat(200)}`;
+  const out = composeResumptionNote({ files: [], ahead: 0, behind: 0, detached: false, stashes: [{ text: long }] });
+  // EXACTLY the clip: slice(0, STASH_TEXT_CLIP - 1) + "…" = 80 chars. Review round 1 measured the
+  // earlier <=81 bound letting a CLIP-1 → CLIP mutant survive the full suite.
+  expect(out.length).toBe(80);
+  expect(out.endsWith("…")).toBe(true);
+  expect(out).not.toContain("(");                      // no timestamp → no date parenthetical
+  const bad = composeResumptionNote({ files: [], ahead: 0, behind: 0, detached: false, stashes: [{ text: "stash@{0}: On main: m", timestamp: "not-a-date" }] });
+  expect(bad).toBe("stash@{0}: On main: m");
+});
+test("composeResumptionNote: rest===1 boundary shows '+1 more' — and a blank text degrades to the word 'stash'", () => {
+  const { composeResumptionNote } = require("../src/subprojects");
+  // Review round 1: the cap test used 4 stashes (rest=2), so a `rest > 0` → `rest > 1` mutant
+  // survived — a 3-stash repo would silently drop its overflow count.
+  const three = [0, 1, 2].map((n) => ({ text: `stash@{${n}}: WIP on b${n}: m${n}` }));
+  expect(composeResumptionNote({ files: [], ahead: 0, behind: 0, detached: false, stashes: three }))
+    .toBe("stash@{0}: WIP on b0: m0; stash@{1}: WIP on b1: m1; +1 more stash(es)");
+  // Blank text (unreachable from git.ts; reduce.ts contemplates non-git producers): no contentless
+  // " (Aug 27)" clause — the count-era word plus the date.
+  expect(composeResumptionNote({ files: [], ahead: 0, behind: 0, detached: false, stashes: [{ text: "  ", timestamp: "2026-08-27T14:00:00-07:00" }] }))
+    .toBe("stash (Aug 27)");
+});
+test("composeResumptionNote: no stashes → no stash clause at all", () => {
+  const { composeResumptionNote } = require("../src/subprojects");
+  expect(composeResumptionNote({ files: [], ahead: 1, behind: 0, detached: true, stashes: [] })).toBe("ahead 1; detached HEAD");
 });
 
 // helper: a repo with two dirty sub-projects
 test("resolveUnits: two dirty sub-projects both surface as Tier-1 units", async () => {
   const { resolveUnits, rankUnits } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-ru-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-ru-")));
   for (const d of ["packages/api", "packages/web"]) mkdirSync(join(repo, d), { recursive: true });
   const cfg: Config = { ...CFG, subprojects: [{ repo, roots: ["packages/*"] }] };
   const uncommitted: Activity = {
@@ -272,7 +313,7 @@ test("resolveUnits: two dirty sub-projects both surface as Tier-1 units", async 
 
 test("resolveUnits: ahead-N clean catch-all is Tier-1 with a resumptionNote", async () => {
   const { resolveUnits } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-ahead-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-ahead-")));
   const branch: Activity = {
     source: "git", kind: "branch", event_id: "b", repo, target: "main",
     text: "On branch main (ahead 2, behind 0)", meta: { aheadBehind: { ahead: 2, behind: 0 } },
@@ -285,7 +326,7 @@ test("resolveUnits: ahead-N clean catch-all is Tier-1 with a resumptionNote", as
 
 test("resolveUnits: idle in-sync repo (branch ahead 0 behind 0, clean) → no units", async () => {
   const { resolveUnits } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-idle-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-idle-")));
   const branch: Activity = { source: "git", kind: "branch", event_id: "b", repo, target: "main",
     text: "On branch main (ahead 0, behind 0)", meta: { aheadBehind: { ahead: 0, behind: 0 } } };
   const { units } = await resolveUnits([branch], [], [repo], CFG);
@@ -294,7 +335,7 @@ test("resolveUnits: idle in-sync repo (branch ahead 0 behind 0, clean) → no un
 
 test("resolveUnits: same-day-only clean sub-project unit is KEPT + labeled, but hasWindowContent=false", async () => {
   const { resolveUnits } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-sdo-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-sdo-")));
   mkdirSync(join(repo, "packages/api"), { recursive: true });
   const cfg: Config = { ...CFG, subprojects: [{ repo, roots: ["packages/*"] }] };
   const todayCommit: Activity = { source: "git", kind: "commit", event_id: "t1", repo, timestamp: "2026-07-13T10:00:00Z", meta: { diffstat: [{ file: "packages/api/x.ts", added: 1, removed: 0 }] } };
@@ -306,7 +347,7 @@ test("resolveUnits: same-day-only clean sub-project unit is KEPT + labeled, but 
 
 test("resolveUnits: detached HEAD → Tier-1 catch-all with a 'detached HEAD' note", async () => {
   const { resolveUnits } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-det-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-det-")));
   const branch: Activity = { source: "git", kind: "branch", event_id: "b", repo, target: "HEAD", text: "Detached HEAD at abc1234", meta: { aheadBehind: { ahead: 0, behind: 0 } } };
   const { units } = await resolveUnits([branch], [], [repo], CFG);
   expect(units[0]!.hasResumptionState).toBe(true);
@@ -315,19 +356,21 @@ test("resolveUnits: detached HEAD → Tier-1 catch-all with a 'detached HEAD' no
 
 test("resolveUnits: a stash → catch-all only, Tier-1, with a stash note", async () => {
   const { resolveUnits } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-stash-"));
-  const stash: Activity = { source: "git", kind: "stash", event_id: "s", repo, target: "stash@{0}", text: "stash@{0}: WIP on main", meta: {} };
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-stash-")));
+  const stash: Activity = { source: "git", kind: "stash", event_id: "s", repo, target: "stash@{0}", text: "stash@{0}: WIP on main: 8cefd59 tweak", timestamp: "2026-08-27T14:00:00-07:00", meta: {} };
   const { units } = await resolveUnits([stash], [], [repo], CFG);
   expect(units.length).toBe(1);
   const cat = units[0]!;
   expect(cat.root).toBeNull();                 // stash is repo-level → catch-all, never a sub-project root
   expect(cat.hasResumptionState).toBe(true);
-  expect(cat.resumptionNote).toBe("1 stash(es)");
+  // Wiring for the day-44/47 stash detail: the Activity's %gs text and date survive into the note —
+  // this is the line that read "1 stash(es)" on the morning the stash's branch was the story.
+  expect(cat.resumptionNote).toBe("stash@{0}: WIP on main: 8cefd59 tweak (Aug 27)");
 });
 
 test("resolveUnits: an unknown-repo subprojects entry → warning", async () => {
   const { resolveUnits } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-unk-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-unk-")));
   const cfg: Config = { ...CFG, subprojects: [{ repo: "/does/not/exist", roots: ["*"] }] };
   const branch: Activity = { source: "git", kind: "branch", event_id: "b", repo, target: "main", text: "On branch main (ahead 1, behind 0)", meta: { aheadBehind: { ahead: 1, behind: 0 } } };
   const { warnings } = await resolveUnits([branch], [], [repo], cfg);
@@ -367,7 +410,7 @@ test("rankUnits: a dirty unit outranks a MORE-RECENT clean unit (Tier-1 beats re
 });
 test("excluded-root: real pipeline — config ['packages','packages/*','!packages/legacy'] keeps parent+sibling, drops legacy; a legacy file folds into the surviving parent", async () => {
   const { resolveProjectRoots, rootOf } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-excl-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-excl-")));
   for (const d of ["packages/api", "packages/legacy"]) mkdirSync(join(repo, d), { recursive: true });
   const cfg: Config = { ...CFG, subprojects: [{ repo, roots: ["packages", "packages/*", "!packages/legacy"] }] };
   const { roots } = await resolveProjectRoots(repo, cfg);
@@ -378,7 +421,7 @@ test("excluded-root: real pipeline — config ['packages','packages/*','!package
 });
 test("excluded-root variant (a): '!'-excluded subtree with NO surviving parent root → catch-all (rootOf null)", async () => {
   const { resolveProjectRoots, rootOf } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-excl2-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-excl2-")));
   for (const d of ["packages/api", "packages/legacy"]) mkdirSync(join(repo, d), { recursive: true });
   const cfg: Config = { ...CFG, subprojects: [{ repo, roots: ["packages/*", "!packages/legacy"] }] }; // NO bare "packages" root
   const { roots } = await resolveProjectRoots(repo, cfg);
@@ -389,7 +432,7 @@ test("excluded-root variant (a): '!'-excluded subtree with NO surviving parent r
 
 test("resolveProjectRoots: a PARTIALLY dead root list warns per-root, not only when all fail [Tier-5]", async () => {
   const { resolveProjectRoots } = await import("../src/subprojects");
-  const repo = mkdtempSync(join(tmpdir(), "dba-roots-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-roots-")));
   mkdirSync(join(repo, "alpha"), { recursive: true });
   mkdirSync(join(repo, "beta"), { recursive: true });
   const cfg = { subprojects: [{ repo, roots: ["alpha", "beta", "gone", "pkgs/*"] }] } as any;
@@ -402,4 +445,53 @@ test("resolveProjectRoots: a PARTIALLY dead root list warns per-root, not only w
   // A glob matching nothing today is not a mistake and must NOT warn — otherwise every optional
   // workspace pattern becomes daily noise.
   expect(warnings.some((w) => w.includes("pkgs/*"))).toBe(false);
+});
+
+// ── `Unit.windowCommits` — the S3 diagnostic's volume input ──────────────────────────────────────
+// MEASURED as having ZERO coverage when it was added (`grep -rn windowCommits test/` → no hits):
+// both properties its comment justifies could be broken with the whole suite still green.
+const wcCommit = (repo: string, id: string, file: string, excluded = false): Activity => ({
+  source: "git", kind: "commit", event_id: id, repo, timestamp: "2026-07-13T10:00:00Z",
+  meta: { diffstat: [{ file, added: 1, removed: 0 }], ...(excluded ? { excluded: true } : {}) },
+});
+
+test("resolveUnits: windowCommits counts WINDOW commits only — a same-day commit must not inflate it", async () => {
+  const { resolveUnits } = await import("../src/subprojects");
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-wc1-")));
+  const { units } = await resolveUnits(
+    [wcCommit(repo, "w1", "a.ts"), wcCommit(repo, "w2", "b.ts")],   // in-window
+    [wcCommit(repo, "t1", "c.ts")],                                  // TODAY — context, not window volume
+    [repo], CFG);
+  const cat = units.find((u) => u.root === null)!;
+  // Kills the mutant that drops the `windowSet.has(a)` gate (would read 3). `commits` cannot answer
+  // this — it accumulates over [...activities, ...today] and so is 3 here by design.
+  expect(cat.windowCommits).toBe(2);
+  expect(cat.latestCommitTime).not.toBeNull();   // sanity: the same-day commit really did land in the unit
+});
+
+test("resolveUnits: windowCommits excludes bot/auto commits — but they still set hasWindowContent", async () => {
+  const { resolveUnits } = await import("../src/subprojects");
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-wc2-")));
+  const { units } = await resolveUnits(
+    [wcCommit(repo, "w1", "a.ts"), wcCommit(repo, "bot", "c.ts", true)], [], [repo], CFG);
+  const cat = units.find((u) => u.root === null)!;
+  // Kills the mutant that drops the `!a.meta?.excluded` gate (would read 2). The two flags answer
+  // DIFFERENT questions and must not be collapsed: volume is the user's own work; window-content
+  // eligibility is legitimately set by an excluded commit.
+  expect(cat.windowCommits).toBe(1);
+  expect(cat.hasWindowContent).toBe(true);
+});
+
+test("resolveUnits: windowCommits is per-unit, not per-repo", async () => {
+  const { resolveUnits } = await import("../src/subprojects");
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-wc3-")));
+  for (const d of ["packages/api", "packages/web"]) mkdirSync(join(repo, d), { recursive: true });
+  const cfg: Config = { ...CFG, subprojects: [{ repo, roots: ["packages/*"] }] };
+  const { units } = await resolveUnits([
+    wcCommit(repo, "a1", "packages/api/x.ts"),
+    wcCommit(repo, "a2", "packages/api/y.ts"),
+    wcCommit(repo, "w1", "packages/web/z.ts"),
+  ], [], [repo], cfg);
+  expect(units.find((u) => u.label === "api")!.windowCommits).toBe(2);
+  expect(units.find((u) => u.label === "web")!.windowCommits).toBe(1);
 });

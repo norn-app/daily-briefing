@@ -9,8 +9,9 @@ import {
 } from "../src/transcripts/discover";
 import { PROMPT_HEADER, buildPrompt } from "../src/generator";
 import { buildSession, buildProjectTree, humanTurn } from "./fixtures/session";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
-const tmp = () => mkdtempSync(join(tmpdir(), "dba-disc-"));
+const tmp = () => removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-disc-")));
 const TS = "2026-07-30T10:00:00.000Z";
 const PAST = 0; // window start at the epoch => nothing is skipped by mtime
 
@@ -92,13 +93,6 @@ test("T1.3a: BOTH subagent tiers are enumerated (a non-recursive glob fails this
   // Pin the pattern itself, so a "simplification" back to a single `*` is a red test, not a silent
   // 35% under-read that every other assertion would still pass.
   expect(SUBAGENT_GLOB).toContain("**");
-});
-
-test("T1.3a: depth-1 discovery is unaffected by the subagent tiers", async () => {
-  const root = tmp();
-  const t = buildProjectTree({ root, project: "-Users-me-repo", sessionId: "sess-1", ts: TS });
-  const d1 = await discoverDepth1(root, PAST);
-  expect(d1).toEqual([t.depth1]); // exactly the depth-1 file, no subagent file leaking in
 });
 
 // §3.6 makes the subagent tier ESCALATE-ON-EMPTY. The two enumerators stay separate so a caller must

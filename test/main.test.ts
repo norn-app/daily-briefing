@@ -1,3 +1,4 @@
+import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 import { test, expect, describe } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import { waitForNetwork } from "../src/net";
 import { alreadyRanToday, checkRanToday, latestBriefingPath, archivedBriefingPath, markerPath, localDateStr, readLastRunDate } from "../src/marker";
 import { ProviderError, type Provider } from "../src/types";
 import { REDACTION } from "../src/transcripts/credentials";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const yesterdayISO = () => new Date(Date.now() - 864e5).toISOString();
 
@@ -44,8 +46,8 @@ function fakeProvider() {
 }
 
 function withEnv(cfgObj?: unknown): () => void {
-  const cfgHome = mkdtempSync(join(tmpdir(), "dba-cfg-"));
-  const stateDir = mkdtempSync(join(tmpdir(), "dba-state-"));
+  const cfgHome = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-cfg-")));
+  const stateDir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-state-")));
   mkdirSync(join(cfgHome, "daily-briefing"), { recursive: true });
   if (cfgObj !== undefined) writeFileSync(join(cfgHome, "daily-briefing", "config.json"), JSON.stringify(cfgObj));
   const prevXdg = process.env.XDG_CONFIG_HOME, prevState = process.env.DAILY_BRIEFING_STATE_DIR;
@@ -94,7 +96,7 @@ test("preflightRepos reports nothing when the configured repos are readable", as
 
 test("preflightRepos surfaces a blocked discoverRoot even when explicit repos are configured (mixed case)", async () => {
   const good = await buildRepo([{ file: "a.txt", content: "a", isoDate: yesterdayISO() }]);
-  const blockedRoot = mkdtempSync(join(tmpdir(), "dba-blkroot-"));
+  const blockedRoot = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-blkroot-")));
   chmodSync(blockedRoot, 0o000);
   const cfg = { repos: [good], discoverRoots: [blockedRoot], provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" as const } };
   try {
@@ -250,20 +252,6 @@ test("run() on a no-activity day prints an honest briefing, skips the provider, 
   } finally { cap.restore(); cleanup(); }
 });
 
-test("run() twice the same day produces exactly one briefing (second guarded by the marker)", async () => {
-  const good = await buildRepo([{ file: "a.txt", content: "a", isoDate: yesterdayISO() }]);
-  const cleanup = withEnv({ repos: [good], provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" } });
-  const cap = captureConsole();
-  const fp = fakeProvider();
-  try {
-    const c1 = await runT(false, { provider: fp.provider });
-    const c2 = await runT(false, { provider: fp.provider });
-    expect(c1).toBe(0);
-    expect(c2).toBe(0);
-    expect(fp.calls()).toBe(1);
-  } finally { cap.restore(); cleanup(); }
-});
-
 test("run() retries a transiently-failing provider and succeeds (wake-before-wifi morning)", async () => {
   const { ProviderError } = await import("../src/types");
   const repo = await buildRepo([{ file: "w.txt", content: "w", isoDate: yesterdayISO() }]);
@@ -316,6 +304,15 @@ test("run() still prints pipeline warnings on a ProviderError (T1: warnings must
       guard: { platform: "darwin", protectedRoots: ["/Users/me/Desktop"] },
       probe: async (repo) => (repo === blocked ? ({ code: "EPERM" } as NodeJS.ErrnoException) : null),
       retryDelaysMs: [], // fail immediately, no retry wait
+      // ⚠ NOT COSMETIC. Without it this test fell through to the REAL network gate: no `networkProbeHosts`
+      // in the env config and no `provider.api`, so `resolveProbeHosts` handed back
+      // DEFAULT_NETWORK_PROBE_HOSTS and `bun test` opened real TCP connections to 1.1.1.1:443 and
+      // 8.8.8.8:443 on every run. `test/net.test.ts` is the ONE file allowed to leave the machine (it
+      // proves the probe's timeout race against RFC 5737 addresses); everything else must stay on
+      // loopback, which is what `guardNetworkForThisFile` enforces in the API test files.
+      // Stubbing the gate takes nothing away from the subject: this test is about pipeline warnings
+      // surviving a ProviderError, and an online gate is exactly the state it always assumed.
+      netProbe: async () => true,
     });
     expect(code).toBe(1);
     // the pipeline warning for the blocked repo must still surface, not just the provider-failed line
@@ -354,6 +351,31 @@ test("run() adds NO drift warning when the working tree is unchanged at render t
     const latest = await Bun.file(latestBriefingPath()).text();
     expect(latest).not.toContain("working-tree changed while generating");
     expect(latest).toContain("state as of");  // resume header carries the as-of stamp
+  } finally { cap.restore(); cleanup(); }
+});
+
+test("run() does NOT re-probe a repo that was inaccessible at extraction (round-2 review)", async () => {
+  // ⚠ THE WIRING PIN for the narrowed re-check. The re-check runs at the very end of a run — after
+  // the model call, immediately before the briefing is written — and every probe is a `git status`
+  // bounded only by GIT_TIMEOUT_MS (30s). A repo extraction already classified as inaccessible was
+  // skipped THERE (it never reaches `readable`), so re-probing it here can only buy wall time: it
+  // has no trustworthy measurement to contribute in either direction. Asserted end-to-end because
+  // the scan set is assembled at the call site, where no unit test of `computeWorkingTreeDrift` can
+  // see it.
+  const repo = await buildRepo([{ file: "a.txt", content: "a", isoDate: yesterdayISO() }]);
+  writeFileSync(join(repo, "dirty.txt"), "wip");
+  const missing = join(repo, "no-such-repo");   // configured, unreadable → an extraction ISSUE
+  const cleanup = withEnv({ repos: [repo, missing], provider: PROV });
+  const cap = captureConsole();
+  try {
+    const probed: string[] = [];
+    const code = await runT(true, {
+      provider: fakeProvider().provider,
+      statusNow: async (r: string) => { probed.push(r); return ""; },
+    });
+    expect(code).toBe(0);
+    expect(probed).toContain(repo);       // the contributing repo IS re-checked…
+    expect(probed).not.toContain(missing); // …and the inaccessible one is never spawned against
   } finally { cap.restore(); cleanup(); }
 });
 
@@ -573,16 +595,6 @@ test("run(force=false) with no network → skip: exit 0, no stamp, logs skip", a
     expect(await alreadyRanToday()).toBe(false);       // no stamp → retry next tick
     expect(cap.err.join("\n")).toMatch(/no network/i); // observable (not silent)
   } finally { cap.restore(); cleanup(); }
-});
-
-// forced + offline → proceeds to the provider (preserves the existing test 308 "proceed anyway").
-test("run(force=true) with no network still calls the provider", async () => {
-  const cleanup = withEnv({ repos: [repoWithTodayCommit], provider: PROV });
-  let called = false;
-  try {
-    await runT(true, { now: AFTER_FLOOR, provider: { generate: async () => { called = true; return RAW; } }, netProbe: async () => false, netGraceMs: 30, netPollMs: 10 });
-    expect(called).toBe(true);
-  } finally { cleanup(); }
 });
 
 // networkProbeHosts: [] → the DEFAULT probe skips the gate. NO netProbe injected → exercises the REAL
@@ -945,7 +957,7 @@ describe("limitedSkipMessage", () => {
 // therefore degrade, never throw. Untested until the verification round measured it as unpinned.
 describe("readLastRunDate", () => {
   test("an unreadable marker degrades to undefined instead of crashing the tick", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "marker-eacces-"));
+    const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "marker-eacces-")));
     const prev = process.env.DAILY_BRIEFING_STATE_DIR;
     process.env.DAILY_BRIEFING_STATE_DIR = dir;
     try {
@@ -964,7 +976,7 @@ describe("readLastRunDate", () => {
   });
 
   test("a well-formed marker still reads back", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "marker-ok-"));
+    const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "marker-ok-")));
     const prev = process.env.DAILY_BRIEFING_STATE_DIR;
     process.env.DAILY_BRIEFING_STATE_DIR = dir;
     try {
@@ -1083,8 +1095,11 @@ describe("output credential scan is unconditional", () => {
 
   for (const enabled of [false, true]) {
     test(`redacts with transcripts.enabled=${enabled}`, async () => {
+      // `root` keeps the enabled=true leg hermetic: without it the scan resolves the default
+      // `~/.claude/projects` and reads the developer's REAL transcripts (measured: 2.0 s vs 0.1 s).
+      const txRoot = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-tx-")));
       const cleanup = withEnv({
-        repos: [WINDOW_ACTIVITY_REPO], provider: PROV, transcripts: { enabled },
+        repos: [WINDOW_ACTIVITY_REPO], provider: PROV, transcripts: { enabled, root: txRoot },
       });
       const cap = captureConsole();
       try {

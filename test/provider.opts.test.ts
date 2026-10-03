@@ -10,6 +10,7 @@
 // the provider's auth and violates the invariant's own preserved-user-config clause. Real subprocesses
 // here rather than a spawn spy, matching the house style in test/provider.test.ts — a spy would assert
 // what we passed, not what the child actually received, and it is the child's view that matters.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
 import { Glob } from "bun";
 import { mkdtemp } from "node:fs/promises";
@@ -18,12 +19,13 @@ import { join, basename, sep } from "node:path";
 import { BYOCliProvider } from "../src/provider";
 import { hardenedProvider } from "../src/harden";
 import { ProviderError, type Provider } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const sh = (script: string, opts = {}) =>
   new BYOCliProvider({ cli: "sh", argv: ["-c", script], promptVia: "stdin" }, opts);
 
 test("B10: `cwd` reaches the child process", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-cwd-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-cwd-")));
   const out = await sh("pwd", { cwd: dir }).generate("");
   expect(out).toContain(basename(dir));
 });
@@ -109,7 +111,7 @@ test("B10: every production provider construction routes through the seam (stati
 });
 
 test("B10: hardenedProvider threads opts through to the child", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-hp-cwd-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-hp-cwd-")));
   const hp = hardenedProvider({ cli: "sh", argv: ["-c", "pwd"], promptVia: "stdin" }, { cwd: dir });
   expect(await hp.generate("")).toContain(basename(dir));
 });

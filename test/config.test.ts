@@ -1,3 +1,4 @@
+import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 // test/config.test.ts
 import { test, expect } from "bun:test";
 import { resolveRepos, discoverRepos, initConfig, compileExcludePatterns, repoLabel, isExcludedRepo, isDir } from "../src/config";
@@ -5,6 +6,7 @@ import { mkdtempSync, mkdirSync, chmodSync, writeFileSync, readFileSync, symlink
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGit } from "../src/git";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 test("resolveRepos returns explicit repos verbatim when present", async () => {
   const cfg = { repos: ["/a", "/b"], provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" as const } };
@@ -12,7 +14,7 @@ test("resolveRepos returns explicit repos verbatim when present", async () => {
 });
 
 test("resolveRepos discovers .git dirs under discoverRoots when repos absent", async () => {
-  const root = mkdtempSync(join(tmpdir(), "dba-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-")));
   mkdirSync(join(root, "proj1", ".git"), { recursive: true });
   mkdirSync(join(root, "proj2", ".git"), { recursive: true });
   const cfg = { discoverRoots: [root], provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" as const } };
@@ -21,7 +23,7 @@ test("resolveRepos discovers .git dirs under discoverRoots when repos absent", a
 });
 
 test("resolveRepos discovers grandchildren (2 levels deep) under discoverRoots", async () => {
-  const root = mkdtempSync(join(tmpdir(), "dba-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-")));
   mkdirSync(join(root, "group", "proj1", ".git"), { recursive: true });
   const cfg = { discoverRoots: [root], provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" as const } };
   const repos = await resolveRepos(cfg);
@@ -29,7 +31,7 @@ test("resolveRepos discovers grandchildren (2 levels deep) under discoverRoots",
 });
 
 test("resolveRepos prefers explicit repos over discoverRoots when both are set (no union, no discovery)", async () => {
-  const root = mkdtempSync(join(tmpdir(), "dba-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-")));
   mkdirSync(join(root, "proj1", ".git"), { recursive: true });
   const cfg = {
     repos: ["/explicit/only"],
@@ -57,7 +59,7 @@ test("discoverRepos: excludeRepos drops a matching repo from an EXPLICIT list (a
 });
 
 test("discoverRepos: excludeRepos matches by basename AND filters DISCOVERED repos, not just explicit ones", async () => {
-  const root = mkdtempSync(join(tmpdir(), "dba-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-")));
   mkdirSync(join(root, "keep", ".git"), { recursive: true });
   mkdirSync(join(root, "chef-repo", ".git"), { recursive: true });
   const cfg = {
@@ -79,9 +81,9 @@ test("isExcludedRepo: matches absolute path or basename; empty/undefined list ex
 });
 
 test("discoverRepos surfaces a blocked (unreadable) discoverRoot as an issue and still finds repos under a readable root", async () => {
-  const good = mkdtempSync(join(tmpdir(), "dba-good-"));
+  const good = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-good-")));
   mkdirSync(join(good, "proj1", ".git"), { recursive: true });
-  const blocked = mkdtempSync(join(tmpdir(), "dba-blocked-"));
+  const blocked = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-blocked-")));
   chmodSync(blocked, 0o000);
   const cfg = { discoverRoots: [good, blocked], provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" as const } };
   try {
@@ -96,7 +98,7 @@ test("discoverRepos surfaces a blocked (unreadable) discoverRoot as an issue and
 test("discoverRepos surfaces a blocked root as an 'unreadable' issue (real EACCES, darwin) — classification not swallowed", async () => {
   // A real readdir on a chmod-000 dir yields EACCES → 'unreadable' (a real EPERM/tcc-denied can't
   // be produced in a tmpdir; that path is covered by the injected-probe tests in main/extractor).
-  const blocked = mkdtempSync(join(tmpdir(), "dba-prot-"));
+  const blocked = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-prot-")));
   chmodSync(blocked, 0o000);
   const cfg = { discoverRoots: [blocked], provider: { cli: "claude", argv: ["-p"], promptVia: "stdin" as const } };
   try {
@@ -113,7 +115,7 @@ test("resolveRepos discovers a repo whose .git is a FILE (a real git worktree), 
   // `.git` is a directory for a normal repo but a "gitdir: <path>" FILE for a worktree (and for
   // submodules). A naive isDir(join(dir, ".git")) check misses the file form, so a worktree's
   // activity would silently vanish from discovery.
-  const root = mkdtempSync(join(tmpdir(), "dba-wt-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-wt-")));
   const mainRepo = join(root, "main");
   mkdirSync(mainRepo, { recursive: true });
   await runGit(["init", "-q", "-b", "main"], mainRepo);
@@ -131,7 +133,7 @@ test("resolveRepos discovers a repo whose .git is a FILE (a real git worktree), 
 });
 
 test("initConfig is a no-op when a config already exists: returns wrote:false and does not overwrite it", async () => {
-  const cfgHome = mkdtempSync(join(tmpdir(), "dba-cfg-"));
+  const cfgHome = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-cfg-")));
   mkdirSync(join(cfgHome, "daily-briefing"), { recursive: true });
   const cfgFile = join(cfgHome, "daily-briefing", "config.json");
   const original = JSON.stringify({ marker: "do-not-touch" });
@@ -167,7 +169,7 @@ test("repoLabel: bare basename when unique, parent-qualified when two configured
 
 test("hasGitEntry is exported and detects a .git entry", async () => {
   const { hasGitEntry } = await import("../src/config");
-  const root = mkdtempSync(join(tmpdir(), "dba-hge-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-hge-")));
   mkdirSync(join(root, "sub", ".git"), { recursive: true });
   expect(await hasGitEntry(join(root, "sub"))).toBe(true);
   expect(await hasGitEntry(root)).toBe(false);
@@ -225,7 +227,7 @@ test("validateConfig: provider.timeoutMs must be a number if present; a valid on
 });
 
 test("initConfig writes networkProbeHosts (discoverable escape hatch for local/offline providers) [Tier-3 #9]", async () => {
-  const cfgHome = mkdtempSync(join(tmpdir(), "dba-init9-"));
+  const cfgHome = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-init9-")));
   const prevXdg = process.env.XDG_CONFIG_HOME;
   process.env.XDG_CONFIG_HOME = cfgHome;
   try {
@@ -246,7 +248,7 @@ test("initConfig writes networkProbeHosts (discoverable escape hatch for local/o
 
 test.skipIf(process.platform === "win32")("discoverRepos descends a symlinked directory (stat-follows-symlink preserved after withFileTypes) [Tier-5]", async () => {
   // (Windows symlinkSync needs elevation/Developer Mode; skip there — CI runs on ubuntu.)
-  const base = mkdtempSync(join(tmpdir(), "dba-symlink-"));
+  const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-symlink-")));
   const root = join(base, "root");
   const container = join(root, "container");
   mkdirSync(container, { recursive: true });
@@ -265,7 +267,7 @@ test.skipIf(process.platform === "win32")("discoverRepos descends a symlinked di
 });
 
 test("isDir: true for a directory, false for a file and a missing path (dedup target for subprojects) [Tier-5]", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "dba-isdir-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-isdir-")));
   const file = join(dir, "f.txt");
   writeFileSync(file, "x");
   expect(await isDir(dir)).toBe(true);
@@ -274,7 +276,7 @@ test("isDir: true for a directory, false for a file and a missing path (dedup ta
 });
 
 test("discoverRepos: a discoverRoot that is ITSELF a repo is found (init from inside your own repo) [Tier-B]", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "dba-selfrepo-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-selfrepo-")));
   mkdirSync(join(repo, ".git")); // the root itself is a repo
   const { repos } = await discoverRepos({ discoverRoots: [repo], provider: { cli: "c", argv: [], promptVia: "stdin" as const } });
   expect(repos).toContain(repo); // the root itself, not just its children
@@ -285,7 +287,7 @@ test("discoverRepos: a discoverRoot that is a repo AND contains nested repos yie
   // real .git (dotfiles tracked directly in $HOME — a genuine pattern), the earlier short-circuit
   // `continue` collapsed discovery to [$HOME] and DROPPED every project repo under ~. The root-is-a-repo
   // case must record the root AND still walk children for independent nested repos.
-  const root = mkdtempSync(join(tmpdir(), "dba-rootrepo-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-rootrepo-")));
   mkdirSync(join(root, ".git"));                                  // the root itself is a repo ($HOME dotfiles)
   mkdirSync(join(root, "proj1", ".git"), { recursive: true });   // an independent nested repo under it
   mkdirSync(join(root, "proj2", ".git"), { recursive: true });
@@ -303,11 +305,11 @@ test("discoverRepos: a discoverRoot that is a repo AND contains nested repos yie
 test("initConfig: cliFound reflects the injected CLI finder (drives the init no-CLI notice) [Tier-B]", async () => {
   const prevXdg = process.env.XDG_CONFIG_HOME;
   try {
-    process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "dba-nocli-"));
+    process.env.XDG_CONFIG_HOME = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-nocli-")));
     const noCli = await initConfig(async () => undefined);       // neither claude nor codex on PATH
     expect(noCli.wrote).toBe(true);
     expect(noCli.cliFound).toBe(false);                          // → init() prints the "install a CLI" notice
-    process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "dba-yescli-"));
+    process.env.XDG_CONFIG_HOME = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-yescli-")));
     const found = await initConfig(async (c) => c === "claude" ? "/usr/bin/claude" : undefined);
     expect(found.cliFound).toBe(true);
   } finally {

@@ -1,3 +1,4 @@
+import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 // test/integration.test.ts — cross-cutting integration tests (Task 17 Step 1b): each of these
 // spans multiple tasks' code, so they live here rather than in any single unit's test file.
 import { test, expect } from "bun:test";
@@ -14,10 +15,11 @@ import { run } from "../src/main";
 import { hardenedProvider } from "../src/harden";
 import { latestBriefingPath, markerExists } from "../src/marker";
 import type { Config, Provider, Activity } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 function withEnv(cfgObj: unknown): () => void {
-  const cfgHome = mkdtempSync(join(tmpdir(), "dba-cfg-"));
-  const stateDir = mkdtempSync(join(tmpdir(), "dba-state-"));
+  const cfgHome = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-cfg-")));
+  const stateDir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-state-")));
   mkdirSync(join(cfgHome, "daily-briefing"), { recursive: true });
   writeFileSync(join(cfgHome, "daily-briefing", "config.json"), JSON.stringify(cfgObj));
   const prevXdg = process.env.XDG_CONFIG_HOME, prevState = process.env.DAILY_BRIEFING_STATE_DIR;
@@ -136,7 +138,7 @@ test("integration: reduce() stage-3 drop of a dirty repo's ctx entry still surfa
 // exercises three INDEPENDENTLY-computed label paths (today-so-far in main.ts, the drift warning
 // in workingTreeDriftWarnings, and the RECAP "UNIT <label>" banner in buildPrompt) — they must agree.
 test("integration: unitForCommit's plurality vote on a REAL multi-file commit's diffstat resolves to the majority root", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "dba-plurality-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-plurality-")));
   await runGit(["init", "-q", "-b", "main"], repo);
   await runGit(["config", "user.email", "test@example.com"], repo);
   await runGit(["config", "user.name", "Test"], repo);
@@ -160,7 +162,7 @@ test("integration: today so far / drift warning / RECAP banner all agree on the 
   // basename disambiguation is the ONE labeling function every path below routes through — main.ts's
   // "Today so far" fallback, workingTreeDriftWarnings' repo-level drift label, and buildPrompt's
   // catch-all UNIT banner — so all three MUST land on the same string if none of them regressed.
-  const parent = mkdtempSync(join(tmpdir(), "dba-agree-"));
+  const parent = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-agree-")));
   const repo = join(parent, "api");
   mkdirSync(repo);
   await runGit(["init", "-q", "-b", "main"], repo);
@@ -206,7 +208,7 @@ test("integration: today so far / drift warning / RECAP banner all agree on the 
 // has no matching Unit AND carries zero commits/files, or it resurrects a spurious empty UNIT banner
 // for a unit resolveUnits already decided doesn't exist.
 test("integration: monorepo subprojects split drops the idle catch-all's branch signal — buildPrompt emits no spurious empty UNIT banner", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "dba-monorepo-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-monorepo-")));
   await runGit(["init", "-q", "-b", "main"], repo);
   await runGit(["config", "user.email", "test@example.com"], repo);
   await runGit(["config", "user.name", "Test"], repo);
@@ -256,7 +258,7 @@ test("integration: monorepo subprojects split drops the idle catch-all's branch 
 // a/x's vote up to "a" via rootOf's deepest-present fallback, creating a false a=2/z=2 tie that
 // lexicographic tie-break resolves to "a" — the WRONG unit vs. resolveUnits' real "z" pick.
 test("integration: buildPrompt buckets against resolveUnits' real (full) roots, not the survivor subset, for nested project roots", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "dba-nested-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-nested-")));
   await runGit(["init", "-q", "-b", "main"], repo);
   await runGit(["config", "user.email", "test@example.com"], repo);
   await runGit(["config", "user.name", "Test"], repo);
@@ -398,7 +400,7 @@ test("integration: a NOTABLE branch is repeated into each unit block — the mod
   // while writing bullets headed with a SUB-PROJECT label. On 2026-08-06 it never made the join:
   // it framed a `policy.toml` edit on `chore/sign-live-policy` as an item23 tail and advised
   // committing it "tying it to that work". It was a signing chore.
-  const repo = mkdtempSync(join(tmpdir(), "dba-branchunit-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-branchunit-")));
   await runGit(["init", "-q", "-b", "main"], repo);
   await runGit(["config", "user.email", "test@example.com"], repo);
   await runGit(["config", "user.name", "Test"], repo);

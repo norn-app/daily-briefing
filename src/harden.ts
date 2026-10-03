@@ -35,6 +35,7 @@ import { expandTilde } from "./config";
 import { supportDir } from "./marker";
 import { probeCapabilities, type Capabilities } from "./probe";
 import { FLAG_REJECTION_RE, failFastMs, TIMEOUT_MS } from "./provider";
+import { redactCredentials } from "./transcripts/credentials";
 
 export type HardenedProvider = Provider & {
   /** Accumulated during `generate()`; read by core AFTER the call and merged into the briefing.
@@ -77,7 +78,10 @@ const FLAG_INJECTIONS: readonly { probe: string; argv: readonly string[] }[] = [
   { probe: "--strict-mcp-config", argv: ["--strict-mcp-config"] },
   { probe: "--no-session-persistence", argv: ["--no-session-persistence"] },
 ];
-const WANTED_FLAGS: readonly string[] = FLAG_INJECTIONS.map((f) => f.probe);
+// EXPORTED (A1) so `doctor --json` probes for exactly the flags this module would inject, derived
+// from the SAME table. A hand-written list in the diagnostic would report capabilities for flags the
+// provider stack no longer wants (or miss one it gained) while looking authoritative.
+export const WANTED_FLAGS: readonly string[] = FLAG_INJECTIONS.map((f) => f.probe);
 
 /** Flags that WIDEN the provider's authority but were measured NOT to defeat an injected flag. Hardening
  *  still holds with these present, so they only warrant a warning — but the user should know they are in
@@ -247,6 +251,14 @@ export async function providerCwd(opts: { preferred: string; tmpFallback: string
   }
 }
 
+/** The tmp-rung working directory: a STABLE name, not mkdtemp, because the provider derives its transcript
+ *  slug from the cwd and a fresh directory per call would scatter one machine's sessions across hundreds
+ *  of slugs. Exported so the one test that drives this rung (harden.activation B3) registers the same
+ *  path for run-end removal from this builder rather than from a second copy of the string. */
+export function providerCwdTmpFallback(): string {
+  return join2(tmpdirSafe(), `daily-briefing-provider-cwd-${process.getuid?.() ?? "nouid"}`);
+}
+
 export function hardenedProvider(cfg: Config["provider"], opts: HardenOpts = {}): HardenedProvider {
   const runtimeWarnings: string[] = [];
   /** Funnel for warnings raised inside a `BYOCliProvider`. `build()` makes a fresh instance per ladder
@@ -309,9 +321,7 @@ export function hardenedProvider(cfg: Config["provider"], opts: HardenOpts = {})
     const base = opts.stateDir ?? supportDir();
     return providerCwd({
       preferred: join2(base, "provider-cwd"),
-      // A STABLE name, not mkdtemp: the provider derives its transcript slug from the cwd, so a fresh
-      // directory per call would scatter one machine's sessions across hundreds of slugs.
-      tmpFallback: join2(tmpdirSafe(), `daily-briefing-provider-cwd-${process.getuid?.() ?? "nouid"}`),
+      tmpFallback: providerCwdTmpFallback(),
     });
   })().catch((e: unknown) => ({
     // Mirrors capsMemo's guard. Unreachable today — `providerCwd` is fully wrapped — but this memo IS
@@ -506,23 +516,34 @@ export function hardenedProvider(cfg: Config["provider"], opts: HardenOpts = {})
         // that proximity: it is the difference between evidence and coincidence.
         const msg = e instanceof Error ? e.message : "";
         const hit = FLAG_REJECTION_RE.exec(msg);
-        const namesOurs = hit !== null && extra
+        // WHICH flag, not just whether: the warning below exists to name it, and it used to recover the
+        // name from `firstLine(e.message)` — a 160-char cut of a message that STARTS with the CLI's
+        // absolute path (init writes `which claude`). Measured: a ~114-char TMPDIR put the fake CLI's
+        // path over budget and the warning ended "error: unknow". A stderr whose first line is an
+        // advisory lost it at any path length. So the name comes from our own token list, and when
+        // several of our flags sit near the phrase (a wrapper echoing its argv) the CLOSEST one is the
+        // one being complained about — `find` in injection order would name `--tools` whenever it is near.
+        const rejected = hit === null ? undefined : extra
           .filter((t) => t.startsWith("--"))
-          .some((t) => {
+          .map((t) => {
             // Word-boundaried, for the same reason the probe's matcher is: measured, a CLI rejecting the
             // USER's own `--toolset` satisfied a plain `indexOf("--tools")` and latched hardening off with
             // the false diagnosis "rejected an injected hardening flag". No unhardened model call was
             // reachable that way — the bare retry still carries the user's bad flag and fails at parse —
             // but a wrong diagnosis plus a wasted attempt is exactly what this gate exists to prevent.
-            const at = flagIndex(msg, t.split("=")[0]!);
-            return at !== -1 && Math.abs(at - hit.index) <= REJECTION_PROXIMITY;
-          });
+            const flag = t.split("=")[0]!;
+            const at = flagIndex(msg, flag);
+            return { flag, gap: at === -1 ? Infinity : Math.abs(at - hit.index) };
+          })
+          .filter((c) => c.gap <= REJECTION_PROXIMITY)
+          .sort((a, b) => a.gap - b.gap)[0]?.flag;
+        const namesOurs = rejected !== undefined;
         // `extra.length > 0` is now SUBSUMED by `namesOurs` (which is false for an empty `extra`), so it is
         // an equivalent clause and cannot be killed on its own — noted because a future edit to `namesOurs`
         // would silently un-protect the nothing-was-injected case with no failing test. Kept as the
         // explicit statement of the precondition.
         if (extra.length > 0 && e instanceof ProviderError && fastEnough && namesOurs) {
-          disableHardening(`the provider CLI rejected an injected hardening flag (${firstLine(e.message)}); hardening flags are disabled for the rest of this run`);
+          disableHardening(`the provider CLI rejected an injected hardening flag: ${rejected} (${firstLine(e.message)}); hardening flags are disabled for the rest of this run`);
           // Bare means BARE: no flags, and no narrow cwd either, since the gate's own reasoning says the
           // cwd move is only justified while the isolation flag is in effect.
           return await build(undefined, []).generate(prompt);
@@ -541,5 +562,8 @@ function join2(a: string, b: string): string { return resolve(a, b); }
  *  a strictly better fallback than shared /tmp. */
 function tmpdirSafe(): string { return tmpdir(); }
 
-/** First line only: a CLI usage error can dump its whole help text after the message. */
-function firstLine(m: string): string { return m.split("\n")[0]!.slice(0, 160); }
+/** First line only: a CLI usage error can dump its whole help text after the message. Redacted BEFORE
+ *  the 160-char cut, never after: a credential straddling the cut would otherwise keep a prefix too
+ *  short for its pattern to match downstream (the warning reaches the briefing's ⚠ line, the envelope
+ *  and last-skip). Exported for test/clip-redacts-first.test.ts only. */
+export function firstLine(m: string): string { return redactCredentials(m.split("\n")[0]!).slice(0, 160); }

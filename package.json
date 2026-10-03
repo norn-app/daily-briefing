@@ -1,7 +1,7 @@
 {
   "name": "daily-briefing",
-  "version": "0.1.1",
-  "description": "Local-first morning briefing CLI for developers who work with AI coding assistants \u2014 reads your git history, tells you where you left off and what to do next. BYO AI, no telemetry.",
+  "version": "0.2.0",
+  "description": "Local-first morning briefing CLI for developers who work with AI coding assistants \u2014 reads your git history, tells you where you left off and what to do next. BYO AI, no telemetry of its own.",
   "keywords": [
     "cli",
     "briefing",
@@ -24,6 +24,19 @@
   "bin": {
     "daily-briefing": "src/main.ts"
   },
+  "files": [
+    "src",
+    "docs",
+    "scripts/audit.ts",
+    "scripts/inspect-whys.ts",
+    "scripts/derive-transcript-schema.ts",
+    "scripts/install.sh",
+    "scripts/uninstall.sh",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md",
+    "tsconfig.json"
+  ],
   "scripts": {
     "start": "bun run src/main.ts",
     "build": "bun build src/main.ts --compile --outfile dist/daily-briefing",

@@ -1,11 +1,15 @@
 // src/config.ts
-import { readdir, stat } from "node:fs/promises";
+import { readdir, stat, chmod } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 import { homedir } from "node:os";
-import type { Config, TokenBudget } from "./types";
+import type { Config, ProviderApi, TokenBudget } from "./types";
+import type { RecapMode } from "./recapCampaigns";
+import { API_LABEL_ANTHROPIC, API_LABEL_OPENAI } from "./types";
 import { classify, type PathIssue, type GuardOpts } from "./protectedPath";
+import { deriveProbeHosts } from "./providers/endpoint";
+import { redactCredentials } from "./transcripts/credentials";
 
 // Short per-repo label for display: the basename, unless another configured repo shares it
 // (e.g. /a/api and /b/api) — then qualify with the parent dir so the briefing never merges two
@@ -60,6 +64,90 @@ export function expandTilde(p: string, home: string): string {
 // not blind-cast into a TypeError deep in the pipeline or silent wrong math — e.g. lookbackCapDays:"4"
 // made `cap + 1` the STRING "41", a 41-day scan). Also normalizes path arrays (~-expansion). Throws
 // `Error("config error: …")` which run()'s catch surfaces as "Config error: …" (exit 2), NOT "no-config".
+/** The synthesized legacy triple for an API provider. `argv` is a FRESH array per call — a shared
+ *  frozen constant would be handed to `BYOCliProvider`-shaped consumers that spread it, and a single
+ *  mutable module-level array reachable from 85 importers of types.ts is a trap nobody needs. */
+export const apiTransportLabel = (kind: ProviderApi["kind"]): string =>
+  kind === "anthropic" ? API_LABEL_ANTHROPIC : API_LABEL_OPENAI;
+
+/** Slice 2/A3. Validate `provider.api` and return it, or THROW `config error: …`.
+ *
+ *  ⚠ THROWS, where `accounts`/`transcripts`/`networkProbeHosts` only warn — and the asymmetry is the
+ *  decision, not an oversight. Those are OPTIONAL FEATURES: disabling one with a warning still delivers
+ *  a briefing. `api` decides WHICH TRANSPORT RUNS and therefore which credential is spent, so there is
+ *  no safe degradation — "we couldn't read your api block so we spawned a CLI instead" is the silent
+ *  wrong-credential failure class this project has already paid for once. It sits on the throwing side
+ *  with the rest of the REQUIRED provider block (see the shape check in validateConfig).
+ *
+ *  ORDER IS DELIBERATE: mutual exclusion is checked FIRST, immediately after "is it an object". Every
+ *  existing user reaching an API provider does so by EDITING a config that already has the triple, so
+ *  "delete these three lines" is the message that will actually be read, and burying it behind a
+ *  `kind` typo would hide it exactly when it is needed. */
+/** An UNPARSEABLE baseUrl, made safe to print. `new URL` already failed on it, so `printableEndpoint`
+ *  cannot be used — cut at the first `?` or `#` textually, say so, then run the shared shape-redactor. */
+function printableRawUrl(raw: string): string {
+  const cut = raw.search(/[?#]/);
+  const head = cut === -1 ? raw : `${raw.slice(0, cut)} (query withheld)`;
+  return redactCredentials(head);
+}
+
+export function validateProviderApi(p: Record<string, unknown>): ProviderApi {
+  const a = p.api;
+  if (!a || typeof a !== "object" || Array.isArray(a)) {
+    throw new Error('config error: "provider.api" must be an object { kind, model, … } (delete it to use a CLI provider)');
+  }
+  const api = a as Record<string, unknown>;
+
+  const clashes = (["cli", "argv", "promptVia"] as const).filter((k) => p[k] !== undefined);
+  if (clashes.length) {
+    throw new Error(`config error: "provider.api" cannot be combined with ${clashes.map((k) => `"provider.${k}"`).join(", ")} — an API provider spawns no CLI. Delete ${clashes.length === 1 ? "that line" : "those lines"} (${clashes.join(", ")}) from "provider", or delete "provider.api" to keep using the CLI.`);
+  }
+
+  if (api.kind !== "anthropic" && api.kind !== "openai-compatible") {
+    throw new Error('config error: "provider.api.kind" must be "anthropic" or "openai-compatible"');
+  }
+  if (typeof api.model !== "string" || api.model.trim() === "") {
+    throw new Error('config error: "provider.api.model" must be a non-empty string — this project deliberately refuses to pick a model for you, because a silently-chosen model changes briefing content without a config change');
+  }
+  if (api.baseUrl !== undefined) {
+    if (typeof api.baseUrl !== "string") throw new Error('config error: "provider.api.baseUrl" must be a string URL');
+    let u: URL;
+    try { u = new URL(api.baseUrl); }
+    // ⚠ THE ECHOED VALUE IS SCRUBBED FIRST. main.ts prints a `config error:` on EVERY 600 s tick, so
+    // this string lands in briefing.log forever — and a scheme-less baseUrl carrying `?api_key=…` is
+    // exactly the shape that reaches here (a valid URL with a query is accepted and never echoed at
+    // all). Same rule as `doctor`'s baseUrl field: query and fragment withheld, then the shared
+    // shape-redactor as a second layer.
+    catch { throw new Error(`config error: "provider.api.baseUrl" is not a valid URL: ${JSON.stringify(printableRawUrl(api.baseUrl))}`); }
+    // http/https ONLY. `file:` would make the "endpoint" a path this code then treats as a network
+    // origin, and a `data:`/`javascript:` URL is nonsense the probe-host derivation would inherit.
+    if (u.protocol !== "http:" && u.protocol !== "https:") {
+      throw new Error(`config error: "provider.api.baseUrl" must use http: or https: (got ${u.protocol})`);
+    }
+    // Userinfo is refused rather than stripped: a credential in a URL is a credential that lands in
+    // every log line, error message and probe-host derivation that ever renders the endpoint. The key
+    // has exactly four supported sources and none of them is the address bar.
+    if (u.username !== "" || u.password !== "") {
+      throw new Error('config error: "provider.api.baseUrl" must not embed a username or password — put the key in apiKeyEnv, apiKeyFile, apiKeyCommand or apiKey instead');
+    }
+  }
+  if (api.maxTokens !== undefined &&
+      (typeof api.maxTokens !== "number" || !Number.isInteger(api.maxTokens) || api.maxTokens <= 0)) {
+    throw new Error('config error: "provider.api.maxTokens" must be a positive whole number');
+  }
+  for (const k of ["apiKeyEnv", "apiKeyFile", "apiKey"] as const) {
+    if (api[k] !== undefined && (typeof api[k] !== "string" || (api[k] as string).trim() === "")) {
+      throw new Error(`config error: "provider.api.${k}" must be a non-empty string`);
+    }
+  }
+  if (api.apiKeyCommand !== undefined &&
+      (!Array.isArray(api.apiKeyCommand) || api.apiKeyCommand.length === 0 ||
+       api.apiKeyCommand.some((x) => typeof x !== "string" || x === ""))) {
+    throw new Error('config error: "provider.api.apiKeyCommand" must be a non-empty array of non-empty strings (argv, e.g. ["my-keychain-helper", "--field", "password"])');
+  }
+  return api as unknown as ProviderApi;
+}
+
 export function validateConfig(raw: unknown, home: string): Config {
   if (!raw || typeof raw !== "object") throw new Error("config error: the config is not a JSON object");
   const c = raw as Record<string, unknown>;
@@ -67,14 +155,29 @@ export function validateConfig(raw: unknown, home: string): Config {
   // on), so validate the whole shape — not just cli — or a missing argv/promptVia still TypeErrors deep
   // in BYOCliProvider.generate (the exact failure mode this validation exists to prevent).
   const p = c.provider as Record<string, unknown> | undefined;
-  if (!p || typeof p !== "object" || typeof p.cli !== "string" ||
-      !Array.isArray(p.argv) || (p.argv as unknown[]).some((x) => typeof x !== "string") ||
-      (p.promptVia !== "stdin" && p.promptVia !== "arg")) {
+  // ── Slice 2/A3: the api branch, inserted AHEAD of the legacy shape check. ────────────────────────
+  // ⚠ ENTERED ONLY when `provider.api` is present, which no config that exists today has — so every
+  // existing user takes the `else if` below completely unchanged, byte for byte. That is a property a
+  // test asserts mechanically (test/config.api.test.ts's legacy-identity table), not a claim.
+  const pObj = p && typeof p === "object" && !Array.isArray(p) ? p : undefined;
+  const api = pObj?.api !== undefined ? validateProviderApi(pObj) : undefined;
+  if (api === undefined &&
+      (!p || typeof p !== "object" || typeof p.cli !== "string" ||
+       !Array.isArray(p.argv) || (p.argv as unknown[]).some((x) => typeof x !== "string") ||
+       (p.promptVia !== "stdin" && p.promptVia !== "arg"))) {
     throw new Error('config error: "provider" must be { cli: string, argv: string[], promptVia: "stdin"|"arg" } (run `daily-briefing init`)');
   }
-  if (p.timeoutMs !== undefined && (typeof p.timeoutMs !== "number" || !Number.isFinite(p.timeoutMs) || p.timeoutMs <= 0)) throw new Error('config error: "provider.timeoutMs" must be a positive number (milliseconds)');
-  if (p.harden !== undefined && typeof p.harden !== "boolean") throw new Error('config error: "provider.harden" must be a boolean (default true — set false only to opt out of provider hardening entirely)');
-  if (p.credential !== undefined && p.credential !== "subscription" && p.credential !== "env-api-key") throw new Error('config error: "provider.credential" must be "subscription" (default — withhold ANTHROPIC_API_KEY so the CLI uses its logged-in subscription) or "env-api-key" (pass the key through and bill API credits)');
+  // Both branches above guarantee an object here (the api branch requires one; the legacy branch threw
+  // otherwise). `pObj!` rather than `p` only because TS cannot see through the two-branch narrowing —
+  // and `pObj` is the checked-object form, so the assertion is on the narrowing, not on the data.
+  // EVERY check below applies to BOTH shapes: `timeoutMs` bounds the API call's AbortController exactly
+  // as it bounds a spawn, and `harden`/`credential` are validated for shape here and warned about as
+  // INAPPLICABLE later (src/providerFactory.ts) — validating them only on the CLI branch would make a
+  // typo in them silently unnoticed on the api branch.
+  const prov = pObj!;
+  if (prov.timeoutMs !== undefined && (typeof prov.timeoutMs !== "number" || !Number.isFinite(prov.timeoutMs) || prov.timeoutMs <= 0)) throw new Error('config error: "provider.timeoutMs" must be a positive number (milliseconds)');
+  if (prov.harden !== undefined && typeof prov.harden !== "boolean") throw new Error('config error: "provider.harden" must be a boolean (default true — set false only to opt out of provider hardening entirely)');
+  if (prov.credential !== undefined && prov.credential !== "subscription" && prov.credential !== "env-api-key") throw new Error('config error: "provider.credential" must be "subscription" (default — withhold ANTHROPIC_API_KEY so the CLI uses its logged-in subscription) or "env-api-key" (pass the key through and bill API credits)');
   // `provider.accounts` is validated at its USE SITE (resolveAccounts, below), not here — the same
   // shape `transcripts` uses. Validating here could only throw or strip: a throw lands at main.ts's
   // `Config error:` + `return 2` on EVERY 600s tick, and stripping destroys the very information a
@@ -122,7 +225,25 @@ export function validateConfig(raw: unknown, home: string): Config {
   // morningTime is intentionally NOT hard-validated: parseFloor (schedule.ts) already degrades a bad
   // value gracefully (default 07:20 + a warning) so the briefing still runs — don't regress that.
   const expand = (v: unknown) => Array.isArray(v) ? (v as string[]).map((x) => expandTilde(x, home)) : v;
-  return { ...(c as Config), repos: expand(c.repos) as Config["repos"], discoverRoots: expand(c.discoverRoots) as Config["discoverRoots"], excludeRepos: expand(c.excludeRepos) as Config["excludeRepos"] };
+  const out: Config = { ...(c as Config), repos: expand(c.repos) as Config["repos"], discoverRoots: expand(c.discoverRoots) as Config["discoverRoots"], excludeRepos: expand(c.excludeRepos) as Config["excludeRepos"] };
+  // ── Slice 2/A3: SYNTHESIZE the frozen triple for an API provider. ────────────────────────────────
+  // The whole point of the mutual exclusion is that the user does not write cli/argv/promptVia — but
+  // types.ts keeps them REQUIRED (the frozen-contract rule forbids retyping a required field to
+  // optional), and 85 importers spread `argv` and switch on `promptVia` unguarded. So the returned
+  // Config is made fully type-valid here, once, instead of every consumer learning about `api`.
+  //
+  // The synthesized `cli` is a stable LABEL, never a path: `claudeShaped("anthropic-api")` is false, so
+  // the transcript gates and `auditMayCarryRawTurn` all fall the safe way with zero edits at those
+  // sites. `promptVia: "stdin"` is the inert choice — the API transports never read either field; it is
+  // spelled out rather than left arbitrary so nothing downstream can read a meaning into "arg".
+  if (api !== undefined) {
+    // `~` in `apiKeyFile` is expanded here, like the path arrays above: the app's setup suggests
+    // `~/.config/…` and writes it verbatim, and `resolveApiKey` reads the path literally. A COPY, so
+    // the caller's raw object is untouched; the config file itself is never rewritten.
+    const apiOut: ProviderApi = api.apiKeyFile !== undefined ? { ...api, apiKeyFile: expandTilde(api.apiKeyFile, home) } : api;
+    out.provider = { ...out.provider, cli: apiTransportLabel(api.kind), argv: [], promptVia: "stdin", api: apiOut };
+  }
+  return out;
 }
 
 // ── Slice 1.5 §3.6: transcripts config + root resolution (T1.1/T1.2) ──────────────────────────────
@@ -160,6 +281,95 @@ export function resolveTranscripts(
   }
   const root = t.root !== undefined ? expandTilde(t.root as string, home) : fallback;
   return { enabled: t.enabled === true, root };
+}
+
+// ── IN-2: verdict-path marker config (EVAL days 51/52) ─────────────────────────────────────────────
+// B1 style, like resolveTranscripts above: a malformed value WARNS and disables the marker, it never
+// throws out of loadConfig — the marker is an annotation, and a typo in it must not cost the morning
+// its briefing (a throw here is `Config error:` + exit 2 on every 600s tick).
+export type ResolvedVerdictPaths = { paths: string[]; warning?: string };
+
+/** `Config.verdictPaths` → normalised repo-relative directory prefixes (no leading `./`, no trailing
+ *  `/`), de-duplicated. Absent/`null`/`[]` ⇒ `[]` with NO warning: unset is the default, not a typo.
+ *
+ *  REJECTED — the whole list, with a warning — when it is not an array of strings, or an entry is
+ *  empty, absolute (`/…`, `~…`), carries a `.`/`..`/empty segment, or carries a glob metacharacter
+ *  (`* ? [ ] { }`, or a leading `!` — `subprojects[].roots`' negation) or a backslash. Each of those
+ *  either matches no diffstat path ever (git's numstat paths are repo-relative, `/`-separated,
+ *  normalised, and matched here as LITERAL prefixes) or, for `.`, would match EVERY commit and mark
+ *  every suggestion — a marker on everything marks nothing.
+ *  The glob case is the likely one, not a curiosity (IN-2 cold review, lenses 1 and 3): the day-52
+ *  judge's own recommendation spells the path `quant_stocks/**` (audit-2026-09-06.md), and the sibling
+ *  key `subprojects[].roots` DOES take globs — accepted silently, it would enable a marker that never
+ *  fires while the operator believes the day-52 defect fixed. Residual: a directory literally named
+ *  with one of those characters cannot be configured (name its parent).
+ *  All-or-nothing rather than dropping the bad entry, for the reason `transcripts` gives: a partially
+ *  applied operator ruling is invisible state.
+ *
+ *  NOT rejected, because it cannot be decided without the repo: a REPO-NAME PREFIX
+ *  (`personal_code/quant_stocks` for a repo named `personal_code`). It never matches unless the repo
+ *  really holds a `personal_code/` folder — and a same-named inner folder is an ordinary layout (a
+ *  Python package's `pkg/pkg/`), so refusing that first segment would refuse legitimate configs. The
+ *  type doc says paths are relative to the repo ROOT, and the audit's `featuresLine` prints the
+ *  resolved paths, so the mistake is visible on the page the EVAL row is written from. CASE is not a
+ *  failure mode at all: the marker matches case-insensitively (core.markVerdictPathSuggestions).
+ *
+ *  ⚠ The warning is FIXED TEXT: it names no example path and never echoes the configured value. It
+ *  renders in the briefing's `⚠` line, which feeds `audit.coverageGaps`' haystack, and an example like
+ *  `quant_stocks/` there would "name" that lane on exactly the misconfigured morning. */
+export function resolveVerdictPaths(raw: unknown): ResolvedVerdictPaths {
+  if (raw === undefined || raw === null) return { paths: [] };
+  const off: ResolvedVerdictPaths = {
+    paths: [],
+    warning: 'config: "verdictPaths" must be an array of literal repo-relative directory paths, no globs — verdict-path marker disabled',
+  };
+  if (!Array.isArray(raw)) return off;
+  const paths: string[] = [];
+  for (const e of raw) {
+    if (typeof e !== "string") return off;
+    const p = e.trim().replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+    if (p === "" || p.startsWith("/") || p.startsWith("~") || p.startsWith("!") || /[*?[\]{}\\]/.test(p)
+      || p.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) return off;
+    paths.push(p);
+  }
+  return { paths: [...new Set(paths)] };
+}
+
+// ── Tier B (Stage-2 recap campaigns): the mode key, spec §4.8 + Appendix D7 ─────────────────────────
+export type ResolvedRecapCampaigns = { mode: RecapMode; warning?: string };
+
+/** `Config.recapCampaigns` → the tier-B mode. The ONE reader of the key (spec §4.8), called with the same
+ *  input at two sites so they cannot disagree: `main.ts` (to widen the run lock) and `runCore` (to gate
+ *  the phase and push `warning` into the page's warnings, as `verdictPaths` does). The
+ *  `resolveVerdictPaths` pattern above: pure, never throws, B1-style degradation.
+ *
+ *  Appendix D7: `undefined`/`null` is ABSENT ⇒ `off` with NO warning (unset is the default, not a typo).
+ *  Anything that is not EXACTLY `{ mode: "off" | "trial" | "on" }` ⇒ `off` plus a warning: a non-object,
+ *  an array, a missing or mistyped `mode`, a mode spelled any other way (`"ON"`, `" on"`), and an object
+ *  carrying ANY other own key beside `mode` (a typo'd sibling is invisible state otherwise). An accessor
+ *  `mode` is a bad shape too — it is read by descriptor, never invoked — and anything that throws while
+ *  being inspected (a hostile Proxy; `runCore` takes a `Config` from any caller, not only JSON) is caught
+ *  and degrades to `off` the same way, so the briefing never pays for a malformed key.
+ *
+ *  ⚠ The warning is FIXED TEXT and never echoes the configured value (the `verdictPaths` rule above): it
+ *  renders in the briefing's `⚠` line, which feeds `audit.coverageGaps`' haystack, so an echoed value
+ *  that happens to be a repo label would "name" that lane on exactly the misconfigured morning. */
+export function resolveRecapCampaigns(raw: unknown): ResolvedRecapCampaigns {
+  if (raw === undefined || raw === null) return { mode: "off" };
+  const off: ResolvedRecapCampaigns = {
+    mode: "off",
+    warning: 'config: "recapCampaigns" must be { mode: "off" | "trial" | "on" } — recap campaigns off',
+  };
+  try {
+    if (typeof raw !== "object" || Array.isArray(raw)) return off;
+    const keys = Reflect.ownKeys(raw);
+    if (keys.length !== 1 || keys[0] !== "mode") return off;
+    const d = Object.getOwnPropertyDescriptor(raw, "mode");
+    const mode: unknown = d !== undefined && "value" in d ? d.value : undefined;
+    return mode === "off" || mode === "trial" || mode === "on" ? { mode } : off;
+  } catch {
+    return off;
+  }
 }
 
 export async function loadConfig(): Promise<Config> {
@@ -274,7 +484,13 @@ export async function resolveRepos(cfg: Config): Promise<string[]> {
 // Resolve the absolute path of a CLI on PATH via `which` (POSIX) / `where` (Windows); returns
 // undefined if not found. launchd agents get a minimal PATH, so a bare name won't resolve at
 // wake-time — the config must store an absolute path (spec §5.1 / final-review FIX 3).
-async function resolveCliPath(cli: string): Promise<string | undefined> {
+//
+// EXPORTED (A1) so `doctor --json` answers "is the provider binary actually there?" with the SAME
+// lookup `init` used to write the config. A second `which` wrapper in json.ts would be free to
+// differ on the two cases this one already handles — Windows `where`, and `where`'s multi-line output.
+// NB harden.ts exports an unrelated `resolveCliPath` (pure ~/relative path math, no spawn); importers
+// of both should alias. This is the one that asks the operating system.
+export async function resolveCliPath(cli: string): Promise<string | undefined> {
   try {
     const finder = process.platform === "win32" ? "where" : "which";
     const p = Bun.spawn([finder, cli], { stdout: "pipe", stderr: "pipe" });
@@ -297,11 +513,64 @@ async function resolveCliPath(cli: string): Promise<string | undefined> {
   } catch { return undefined; }
 }
 
+/** The `--provider …` flag set, parsed by main.ts and handed here. Deliberately NOT a TTY wizard:
+ *  `initConfig` returns early whenever a config exists, so init is a FIRST-RUN-ONLY path and every
+ *  existing user reaches an API provider by editing the file regardless. Slice 5's GUI owns onboarding;
+ *  building a terminal chooser now is building the thing the spine replaces. Flags are scriptable and
+ *  testable without a pty. */
+export type InitApiOptions = {
+  kind: ProviderApi["kind"];
+  model: string;
+  baseUrl?: string;
+  apiKeyEnv?: string;
+  apiKeyFile?: string;
+  apiKeyCommand?: string[];
+};
+
 export async function initConfig(
   resolveCli: (cli: string) => Promise<string | undefined> = resolveCliPath, // injectable for tests
-): Promise<{ path: string; wrote: boolean; cliFound: boolean }> {
+  api?: InitApiOptions,
+): Promise<{ path: string; wrote: boolean; cliFound: boolean; api?: ProviderApi }> {
   const path = configPath();
   if (await Bun.file(path).exists()) return { path, wrote: false, cliFound: true };
+
+  // ── A3/T10: the API branch. Written ONLY when --provider was given; with no flags the CLI detection
+  // and the template below are UNCHANGED, byte for byte (pinned by a snapshot test).
+  if (api !== undefined) {
+    const apiBlock: ProviderApi = {
+      kind: api.kind,
+      model: api.model,
+      ...(api.baseUrl !== undefined ? { baseUrl: api.baseUrl } : {}),
+      ...(api.apiKeyEnv !== undefined ? { apiKeyEnv: api.apiKeyEnv } : {}),
+      ...(api.apiKeyFile !== undefined ? { apiKeyFile: api.apiKeyFile } : {}),
+      ...(api.apiKeyCommand !== undefined ? { apiKeyCommand: api.apiKeyCommand } : {}),
+    };
+    const discoverRoots = [process.cwd(), homedir()];
+    const discovered = await resolveRepos({ discoverRoots, provider: { cli: apiTransportLabel(api.kind), argv: [], promptVia: "stdin", api: apiBlock } });
+    // ⚠ THE DERIVED PROBE HOSTS ARE NOT OPTIONAL HERE. `initConfig` writes networkProbeHosts
+    // EXPLICITLY (see the CLI template below), and the runtime derivation in core.ts fires only when
+    // the key is ABSENT — so writing the anycast pair here would make T9 dead on every freshly
+    // initialized install, which is the trap the design calls out by name.
+    const derived = deriveProbeHosts(apiBlock);
+    const template: Config = {
+      ...(discovered.length ? { repos: discovered } : {}),
+      discoverRoots,
+      // NO cli/argv/promptVia (validateConfig would throw — that is the mutual exclusion), and NO
+      // `credential`/`harden`: both are properties of a spawned child and writing them at their
+      // defaults would make two inapplicable settings look like part of this configuration.
+      provider: { api: apiBlock } as unknown as Config["provider"],
+      tokenBudget: DEFAULT_BUDGET,
+      lookbackCapDays: DEFAULT_LOOKBACK_CAP_DAYS,
+      ...(derived !== undefined ? { networkProbeHosts: derived } : {}),
+    };
+    await Bun.write(path, JSON.stringify(template, null, 2));
+    // An api config is a credential-adjacent file BY CONSTRUCTION: even when the key lives in an env
+    // var today, `apiKey` is a supported field and this is the file people paste it into. Tightening
+    // the mode on OUR OWN freshly created file costs nothing and removes the window in which a
+    // hand-added key sits world-readable. The CLI branch below is deliberately untouched.
+    try { await chmod(path, 0o600); } catch { /* a best-effort tightening must not fail init */ }
+    return { path, wrote: true, cliFound: false, api: apiBlock };
+  }
   // detect an installed provider CLI (spec §5.1); default to claude
   const claudePath = await resolveCli("claude");
   const codexPath = claudePath ? undefined : await resolveCli("codex");

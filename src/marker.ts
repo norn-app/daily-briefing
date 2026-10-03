@@ -2,6 +2,7 @@
 import { join } from "node:path";
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
+import { redactCredentials } from "./transcripts/credentials";
 
 // Cross-platform state dir (mirrors config.ts's XDG-aware configPath, so state doesn't land in a fake
 // ~/Library tree off macOS): macOS → ~/Library/Application Support, Windows → %LOCALAPPDATA%, else the
@@ -96,8 +97,117 @@ export async function stampTick(nowIso: string, todayLocal: string): Promise<num
   }
 }
 
+/** THE SKIP RECORD — `<state>/last-skip.json`, the negative-space companion to `last-run`.
+ *
+ *  ⚠ WHY A SECOND FILE RATHER THAN A FIELD ON THE MARKER. `last-run` records DELIVERY and is what the
+ *  once-per-day guard reads; folding a skip into it would mean a skip could be mistaken for a
+ *  delivery by any of the four readers of that file. This one records the opposite fact — the most
+ *  recent tick that returned WITHOUT delivering, and why — which is the question a GUI Schedule panel
+ *  and the delegated-install verification loop both ask ("it is 09:00 and no briefing arrived: is the
+ *  scheduler dead, or did the run decline, and for what reason?"). Before this, every non-delivering
+ *  return of `run()` wrote nothing at all except a stderr line into a log nobody reads.
+ *
+ *  ⚠ OVERWRITTEN, never appended: it answers "why did the LAST one skip", not "what has ever
+ *  happened". `briefing.log` is the history.
+ *
+ *  ⚠ REMOVED ON DELIVERY, and that is load-bearing rather than tidiness: a record left behind after a
+ *  successful run would let yesterday's "offline" mask today's delivered briefing, i.e. the file
+ *  would report a failure that had already been superseded. The reader's contract is therefore
+ *  "present ⇒ the last thing that happened was a skip".
+ *
+ *  ⚠ AND THAT REMOVAL HOLDS FOR ABOUT ONE TICK — SWITCH ON `reason`, NEVER ON PRESENCE.
+ *  the launchd agent (src/schedule/units.ts `launchdPlist`) runs `<bin> run` on StartInterval 600 —
+ *  and, since Slice 4, ALSO once at the morning floor via StartCalendarInterval — so ~10 minutes after a
+ *  delivery the once-per-day gate fires and re-creates this file with reason "already-ran", and every
+ *  tick until midnight rewrites it. On a HEALTHY day it is therefore absent for ~10 minutes and
+ *  present for the remaining ~17 hours. The literal contract above survives — an already-ran record IS
+ *  a skip, its localDate IS today — but a consumer keying "is anything wrong?" off the file EXISTING
+ *  would false-positive every single day. "already-ran" is the steady state after a success.
+ *
+ *  ⚠ NEVER FATAL, in either direction. Writing it is wrapped by the caller and reading it is total —
+ *  a diagnostic must never cost a morning, the same rule `stampTick` follows one file above. */
+export type LastSkip = {
+  iso: string;         // the UTC instant of the skipping tick
+  localDate: string;   // the LOCAL day it belonged to (same two-units rule as stampTick — see its docstring)
+  reason: string;      // one of SKIP_REASONS (src/json.ts) — a closed vocabulary the GUI switches on
+  detail?: string;     // free text for a human; never parsed
+};
+
+export function lastSkipPath(): string {
+  return join(supportDir(), "last-skip.json");
+}
+
+/** Total: swallows every failure. The caller still wraps it — see main.ts's `noteSkip` — because
+ *  defence in depth costs one `.catch` and the failure being defended against is losing a briefing.
+ *
+ *  ⚠ E1: `detail` IS REDACTED HERE, at the file boundary, with the same `redactCredentials` the
+ *  briefing goes through — once, for every caller. It is free text built from a provider's own error
+ *  message (`provider-fail`: `${code}: ${message}`, up to 600 chars of the CLI's stdout+stderr, which
+ *  an auth failure can echo a key into), a crash message, or a thrown fs error. `status --json` and the
+ *  GUI's Schedule panel both read this file back, so an unredacted detail reached the screen. */
+export async function writeLastSkip(s: LastSkip): Promise<void> {
+  const safe = s.detail === undefined ? s : { ...s, detail: redactCredentials(s.detail) };
+  try { await Bun.write(lastSkipPath(), `${JSON.stringify(safe)}\n`); } catch { /* diagnostic only */ }
+}
+
+/** Remove the skip record. Fail-open: an undeletable record is a stale diagnostic, never a lost run. */
+export async function clearLastSkip(): Promise<void> {
+  try { await unlink(lastSkipPath()); } catch { /* absent (the common case) or unremovable */ }
+}
+
+/** Read it back, or `undefined` when absent/corrupt. Never throws — a corrupt record must read as
+ *  "no record", not as an exception in a status surface that is polled every few seconds. */
+export async function readLastSkip(): Promise<LastSkip | undefined> {
+  try {
+    const f = Bun.file(lastSkipPath());
+    if (!(await f.exists())) return undefined;
+    const o = JSON.parse(await f.text()) as Partial<LastSkip>;
+    if (typeof o?.iso !== "string" || typeof o.localDate !== "string" || typeof o.reason !== "string") return undefined;
+    return { iso: o.iso, localDate: o.localDate, reason: o.reason, ...(typeof o.detail === "string" ? { detail: o.detail } : {}) };
+  } catch { return undefined; }
+}
+
 export function markerPath(): string {
   return join(supportDir(), "last-run");
+}
+
+/**
+ * `<state>/schedule.json` — the scheduling single-owner record.
+ *
+ * ⚠ THE PATH LIVES HERE, WITH THE OTHER STATE PATHS, WHILE THE RECORD ITSELF LIVES IN
+ * `src/schedule/install.ts` — and the split is deliberate. `src/json.ts` needs only the PATH (it is
+ * one entry in the state-paths surface), and while the function was defined in the installer that
+ * need was a STATIC import edge from the run path into the scheduler: every `daily-briefing run`
+ * evaluated the installer module and its `proc.run` default exec for a subcommand it never invokes.
+ * `install.ts` re-exports this so its own callers are unchanged; there is exactly one definition.
+ */
+export function schedulePath(): string {
+  return join(supportDir(), "schedule.json");
+}
+
+/**
+ * `<state>/recap-campaigns.jsonl` — tier B's trial record (spec §4.10 1): one JSON line appended per run
+ * that reaches B's phase with the mode not `off`; append-only, never rotated.
+ *
+ * ⚠ HERE, beside `schedulePath`, for that function's reason and one more (Appendix D17's import rule):
+ * B's phase must reach this path WITHOUT importing `./json`. `json.ts` imports `./runlock`, which imports
+ * `./core`, and the phase is imported BY `core` — so taking the path from `statePaths()` would close a
+ * cycle. This module imports only node builtins. `json.ts` lists it in `StatePaths` and `engineOwns`.
+ */
+export function recapCampaignsPath(): string {
+  return join(supportDir(), "recap-campaigns.jsonl");
+}
+
+/**
+ * `<state>/update-check.json` — Phase E's opt-in update check (E11): the LAST answer, overwritten
+ * atomically by each check. Read back by `status --json` (no network) and by the automatic path's
+ * "is a check due?" gate. Written by `src/updateCheck.ts` and by nothing else.
+ *
+ * ⚠ HERE, beside the other state paths, for `schedulePath`'s reason: `json.ts` lists it in
+ * `StatePaths` and `engineOwns`, so `--json-out` can never truncate it.
+ */
+export function updateCheckPath(): string {
+  return join(supportDir(), "update-check.json");
 }
 
 /** The marker FILE exists at all (any date) — i.e. a briefing has succeeded at least once.

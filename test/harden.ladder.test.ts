@@ -13,13 +13,15 @@
 //   AMBIGUOUS — nonzero exit with nothing conclusive on stderr. Cannot distinguish "rejected our flag"
 //   from "network hiccup", so only probe it on the LAST withRetry attempt, and only if the attempt
 //   failed FAST (a usage error returns in ~90ms; a real provider call does not).
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
-import { mkdtemp, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hardenedProvider } from "../src/harden";
 import { withRetry, withHardeningLadder } from "../src/provider";
 import { ProviderError } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const fast = { probeMs: 3_000, flushMs: 150 };
 
@@ -38,7 +40,7 @@ echo "BARE-OK"
 }
 
 test("B6 fast path: a PROVEN flag rejection disables hardening and retries bare, in one call", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dba-lad-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad-")));
   const cli = await pickyClaude(dir);
   const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
   const out = await hp.generate("x");
@@ -48,10 +50,46 @@ test("B6 fast path: a PROVEN flag rejection disables hardening and retries bare,
   expect(w).toContain("--strict-mcp-config");                    // names the flag the CLI refused
 });
 
+test("B6 fast path: the refused flag is still named when the CLI's own path fills the excerpt", async () => {
+  // Measured 2026-09-21: the excerpt in this warning is a 160-char cut of `<cli path> exited 2: <stderr>`,
+  // and `init` writes the absolute `which claude` path into the config, so the path always leads. A
+  // ~114-char TMPDIR was enough to cut the flag out of the test above ("error: unknow"), and a user with a
+  // deep install path loses it the same way. This path is over 160 characters whatever TMPDIR is.
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad-long-")));
+  const deep = join(dir, "a".repeat(60), "b".repeat(60), "c".repeat(60));
+  await mkdir(deep, { recursive: true });
+  const cli = await pickyClaude(deep);
+  expect(cli.length).toBeGreaterThan(160);                       // the premise: the path alone exhausts the cut
+  const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
+  expect(await hp.generate("x")).toContain("BARE-OK");
+  expect(hp.runtimeWarnings.join(" ")).toContain("rejected an injected hardening flag: --strict-mcp-config");
+});
+
+test("B6 fast path: the refused flag is named even when stderr's FIRST line is something else", async () => {
+  // The excerpt is the message's first line only, so a CLI that prints anything before the rejection (an
+  // advisory, a deprecation note) hid the flag at any path length — the gate still fired, because it
+  // searches the whole message, but the warning could not say what it had backed off from.
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad-adv-")));
+  const cli = await pickyClaude(dir, { reject: "note: an advisory line\nerror: unknown option '--strict-mcp-config'" });
+  const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
+  expect(await hp.generate("x")).toContain("BARE-OK");
+  expect(hp.runtimeWarnings.join(" ")).toContain("rejected an injected hardening flag: --strict-mcp-config");
+});
+
+test("B6 fast path: when several injected flags sit near the phrase, the CLOSEST one is named", async () => {
+  // A wrapper that echoes the argv it was given puts every injected flag inside the proximity window.
+  // Taking the first match in injection order would blame `--tools` for every rejection.
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad-echo-")));
+  const cli = await pickyClaude(dir, { reject: "error: unknown option '--strict-mcp-config' in: --tools= --setting-sources user --strict-mcp-config" });
+  const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
+  expect(await hp.generate("x")).toContain("BARE-OK");
+  expect(hp.runtimeWarnings.join(" ")).toContain("rejected an injected hardening flag: --strict-mcp-config");
+});
+
 test("B6 fast path: the latch HOLDS — a second call does not re-inject the rejected flag", async () => {
   // Without a latch every attempt pays the rejection again: 3 attempts x 2 calls, and 135s of withRetry
   // sleeps between them. The latch is what turns that into one wasted call for the process lifetime.
-  const dir = await mkdtemp(join(tmpdir(), "dba-lad2-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad2-")));
   const cli = await pickyClaude(dir);
   const log = join(dir, "calls.log");
   await writeFile(cli, `#!/bin/sh
@@ -72,7 +110,7 @@ echo "BARE-OK"
 test("B6 fast path: a rejection phrase does NOT disable hardening when nothing was injected", async () => {
   // A non-claude CLI that happens to print "unknown option" about the USER's own argv must not be read
   // as our flag being rejected — we injected nothing, so there is nothing to back off from.
-  const dir = await mkdtemp(join(tmpdir(), "dba-lad3-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad3-")));
   const cli = join(dir, "codex");
   await writeFile(cli, "#!/bin/sh\necho \"error: unknown option '--their-flag'\" >&2\nexit 2\n", { mode: 0o755 });
   const hp = hardenedProvider({ cli, argv: ["--their-flag"], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
@@ -94,7 +132,7 @@ test("B6 ambiguous rung: only fires on the LAST attempt, and only when the failu
   // Placing it on the last attempt moves the ~90ms misattribution window from t=0.09s — peak
   // wake-before-wifi hazard, where a network failure looks exactly like a usage error — out to
   // t=135.3s, where it is near zero. It does not eliminate it; it relocates it to where it is harmless.
-  const dir = await mkdtemp(join(tmpdir(), "dba-lad4-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad4-")));
   const cli = join(dir, "claude");
   const log = join(dir, "calls.log");
   // Fails with NOTHING conclusive on stderr, so the fast path cannot fire; bare succeeds.
@@ -115,7 +153,7 @@ test("B6 ambiguous rung: a SLOW failure never triggers it, even if bare would ha
   // the story — most likely it is the wake-before-wifi network failure the retry schedule exists for.
   // Acting on it would disable hardening permanently on the strength of a coincidence. Here bare WOULD
   // succeed, so without the gate the ladder "proves" the flags were at fault and downgrades the posture.
-  const dir = await mkdtemp(join(tmpdir(), "dba-lad-slow-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad-slow-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources'; exit 0; fi
@@ -147,7 +185,7 @@ test("B6 ambiguous rung: a TIMEOUT is rethrown and draws NO conclusion", async (
 test("B6 ambiguous rung: when BARE also fails, conclude nothing and keep hardening", async () => {
   // The honest outcome for an inconclusive experiment. Disabling hardening on a failure that had nothing
   // to do with our flags would be a silent, permanent posture downgrade bought with no evidence.
-  const dir = await mkdtemp(join(tmpdir(), "dba-lad5-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad5-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources'; exit 0; fi
@@ -168,7 +206,7 @@ test("B6 fast path: a SLOW failure never latches, even with a perfect rejection 
   // The fast path fired on ANY nonzero exit whose message matched, with no duration gate — measured
   // latching on a 6.24s failure, 70x the ~90ms a real usage error takes. The ambiguous rung enforces this
   // discipline; the rung that fires FIRST and on EVERY attempt did not.
-  const dir = await mkdtemp(join(tmpdir(), "dba-slow-rej-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-slow-rej-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources'; exit 0; fi
@@ -186,7 +224,7 @@ test("B6 fast path: the message must NAME a flag we actually sent — not just a
   // `fix: handle unknown option in the parser` was otherwise sufficient evidence to disable hardening and
   // immediately re-run the same hostile prompt bare. Same rule B7 applies to argv: attacker text must
   // never steer a security decision.
-  const dir = await mkdtemp(join(tmpdir(), "dba-name-rej-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-name-rej-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources'; exit 0; fi
@@ -201,7 +239,7 @@ test("B5: PARTIAL probe support is announced — a silently missing --tools is t
   // The activation review fixed this class for --setting-sources and left it unfixed for --tools, the
   // primary injection-to-execution barrier. A future CLI that renames or hides it would silently remove
   // the main protection forever while the README still promised it.
-  const dir = await mkdtemp(join(tmpdir(), "dba-partial-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-partial-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--setting-sources --strict-mcp-config --no-session-persistence'; exit 0; fi
@@ -221,7 +259,7 @@ test("B6 fast path: the VALUE token `user` is not evidence — only a FLAG count
   // token `user` from `--setting-sources user`. The bare word "user" appears in a large fraction of English
   // error text, so a message naming NO flag at all satisfied it and latched hardening off. This is the
   // reviewer's exact reproduction: a rejection phrase plus "user", no flag anywhere.
-  const dir = await mkdtemp(join(tmpdir(), "dba-uservalue-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-uservalue-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources --strict-mcp-config'; exit 0; fi
@@ -236,7 +274,7 @@ test("B6 fast path: a flag mentioned FAR from the rejection phrase is coincidenc
   // A real CLI prints them adjacent: `error: unknown option '--strict-mcp-config'`. A commit subject that
   // merely mentions `--tools` somewhere in a paragraph that also contains "invalid option" is not a
   // rejection — and model output quoting commit subjects is exactly where both could co-occur by chance.
-  const dir = await mkdtemp(join(tmpdir(), "dba-farflag-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-farflag-")));
   const cli = join(dir, "claude");
   const pad = "x".repeat(160);
   await writeFile(cli, `#!/bin/sh
@@ -254,7 +292,7 @@ test("B6 ambiguous rung: rung 1 retries WITH flags — a transient failure keeps
   // likely explanation for an ambiguous failure and the cheapest to keep, so it is tried FIRST — and if it
   // works, hardening must survive untouched. Also the only ladder test with a multi-attempt schedule:
   // every other one passes `[]`, so "last attempt only" was never actually exercised.
-  const dir = await mkdtemp(join(tmpdir(), "dba-rung1-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-rung1-")));
   const cli = join(dir, "claude");
   const counter = join(dir, "n");
   await writeFile(counter, "0");
@@ -283,7 +321,7 @@ test("B6 fast path: the disable warning is raised ONCE, not once per attempt", a
   // this test and the whole suite, because latching also empties `extra` so the fast path cannot re-fire.
   // An earlier version of this comment claimed the guard was pinned, contradicting the source comment
   // added in the very same commit. What survives a mutation and what a test asserts are different things.
-  const dir = await mkdtemp(join(tmpdir(), "dba-once-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-once-")));
   const cli = await pickyClaude(dir);
   const hp = hardenedProvider({ cli, argv: [], promptVia: "stdin" }, { ...fast, stateDir: join(dir, "state") });
   await hp.generate("a");
@@ -295,7 +333,7 @@ test("B6 ambiguous rung: the bare probe's own warnings do not leak into the run'
   // While suppressed, `generate()` sees no isolation flag and would otherwise push "kept this process's
   // working directory…" — a capability-gap diagnosis for a deliberate experiment, landing in the briefing
   // next to the ladder's own correct explanation. Dropping the `suppressed === 0` guard survived.
-  const dir = await mkdtemp(join(tmpdir(), "dba-noleak-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-noleak-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources'; exit 0; fi
@@ -313,7 +351,7 @@ test("B3: a cwd that becomes unusable MID-RUN is recovered from, not blamed on t
   // un-`chdir`-able minutes later — removed, remounted, chmod'd — and Bun reports that as ENOENT/EACCES
   // naming the BINARY, so without this rung the morning blames the user's CLI for a directory problem.
   // Provoked by breaking the memoised directory AFTER the first successful call.
-  const dir = await mkdtemp(join(tmpdir(), "dba-vanish-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-vanish-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources'; exit 0; fi
@@ -333,7 +371,7 @@ test("B6 fast path: a rejection of the USER's `--toolset` is not a rejection of 
   // injected hardening flag" plus a wasted bare attempt. No unhardened model call was reachable — the bare
   // retry still carries the user's bad flag and dies at parse — but a confidently wrong diagnosis is
   // exactly what this gate exists to prevent. Same word-boundary rule the probe's matcher already used.
-  const dir = await mkdtemp(join(tmpdir(), "dba-toolset-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-toolset-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources --strict-mcp-config'; exit 0; fi
@@ -355,7 +393,7 @@ test("T15: the fast path REFUSES to latch when the evidence came from a partial 
   // errored or held stream: `drain` resolves instead of rejecting, so the attempt is fast while the
   // message still carries partial, prompt-derived bytes. This CLI models exactly that: it emits the
   // rejection phrase, then leaves a grandchild holding the pipe, and exits fast.
-  const dir = await mkdtemp(join(tmpdir(), "dba-lad-partial-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-lad-partial-")));
   const cli = join(dir, "claude");
   await writeFile(cli, `#!/bin/sh
 if [ "$1" = "--help" ]; then echo '--tools --setting-sources --strict-mcp-config'; exit 0; fi

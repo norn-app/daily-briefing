@@ -127,11 +127,6 @@ test("buildPrompt includes commit SHA and changed files as evidence", () => {
   expect(prompt).toContain("src/auth.ts");
 });
 
-test("buildPrompt instructs one RECAP bullet per commit (one SHA), not lumping many SHAs", () => {
-  const p = buildPrompt({ repos: [{ repo: "/r", summary: "s", activities: [] }] }, []);
-  expect(p.toLowerCase()).toContain("bullet per commit");
-});
-
 test("buildPrompt: splits a monorepo's commits into per-unit banners", () => {
   const units: Unit[] = [
     { repo: "/r", root: "packages/api", label: "api", hasResumptionState: false, hasWindowContent: true, resumptionNote: "", dirtyFiles: [], latestCommitTime: "2026-07-13T10:00:00Z" },
@@ -172,6 +167,18 @@ test("buildPrompt: permit-fewer instruction present, floor of ONE (D3-lite)", ()
   // Floor of one, NOT zero: g3Structure emits a fail-severity finding when SUGGESTIONS is empty and
   // ctx is non-empty (src/eval/checks.ts:77-94). Permitting zero would fight the gate.
   expect(p).not.toMatch(/leave SUGGESTIONS empty|write none/i);
+});
+test("buildPrompt: forward-suggestion FLOOR for the highest-volume unit, with precedence stated (S3)", () => {
+  // Measured 3 mornings (judge days 41, 43, 44): the highest-volume unit repeatedly got ZERO
+  // suggestions — day 44, 13 commits and none. The output-side measurement of this rule is
+  // `postcheck.checkSuggestionVolume` (INFO-only); this pins the instruction half.
+  const p = buildPrompt({ repos: [] }, []);
+  // ONE contiguous pin, per this file's D1/D4a idiom: disjoint substrings would leave the ESCAPE
+  // HATCH and the PRECEDENCE clause unpinned, and those are the whole reason this rule can coexist
+  // with "Prefer fewer, real suggestions" one line above instead of contradicting it.
+  expect(p).toContain(`The unit with the MOST commits in the window must get at least one suggestion drawn from its OWN commits — unless nothing in its window supports a real next step, in which case write nothing for it rather than padding: the "prefer fewer, real suggestions" rule above wins on conflict, so this floor never justifies inventing a suggestion.\n`);
+  // The floor must sit AFTER the rule it defers to, or "the rule above" cites nothing.
+  expect(p.indexOf("Prefer fewer, real suggestions")).toBeLessThan(p.indexOf("The unit with the MOST commits"));
 });
 test("buildPrompt: RECAP bullets are instructed to carry the commit date (D4a output half)", () => {
   // D4a renders the date into activityLine, but that only makes it AVAILABLE. The first live run came

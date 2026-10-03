@@ -8,6 +8,7 @@
 // With only ONE timestamp printed, that success was indistinguishable from a failure. It was misread
 // as one by two readers in sequence: an EVAL row was filed as DELIVERY FAILED, retracted, and then
 // the retraction's own framing had to be corrected. Two printed timestamps prevent all of it.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
 import { renderBriefing } from "../src/render";
 import type { BriefingStruct } from "../src/types";

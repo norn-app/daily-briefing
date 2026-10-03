@@ -6,6 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { RepoSpec } from "../../src/eval/types";
+import { removeAtRunEnd } from "./temp-dirs";
 
 const GIT_ISOLATION_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 
@@ -57,7 +58,7 @@ export async function buildEvalRepo(spec: RepoSpec): Promise<{
   commitMessages: Map<string, string>;
   shaToDaysAgo: Map<string, number>;
 }> {
-  const dir = mkdtempSync(join(tmpdir(), "dba-eval-repo-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-eval-repo-")));
   await git(["init", "-q", "-b", "main"], dir);
   await git(["config", "user.name", "Eval Bot"], dir);
   await git(["config", "user.email", "eval@example.com"], dir);

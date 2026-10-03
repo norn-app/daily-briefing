@@ -1,8 +1,9 @@
 // Slice 1.5 M7 — frame (T7.1), projection (T7.3), render (T7.4), invariant 1 (T7.5),
 // health-write ordering (T7.6) and the decision-shape filter (T7.7).
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
 import { renderBriefing } from "../src/render";
-import { renderWhy, parseWhy, isWhyLine, WHY_PREFIX } from "../src/transcripts/frame";
+import { renderWhy, parseWhy, isWhyLine } from "../src/transcripts/frame";
 import { isTaskShaped } from "../src/transcripts/taskShape";
 import { selectTurn } from "../src/transcripts/select";
 import { textSha } from "../src/transcripts/anchor";
@@ -11,6 +12,7 @@ import { emptyEvidence, type TranscriptRunCounters } from "../src/transcripts/sc
 import { unitKey } from "../src/subprojects";
 import { buildRepo } from "./fixtures/build-repo";
 import type { BriefingStruct, Config } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const yesterdayNoon = () => { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - 1); return d.toISOString(); };
 const base: BriefingStruct = {
@@ -47,8 +49,8 @@ async function repoAt(dir: string, file: string, iso: string): Promise<void> {
 async function collidingRepos(): Promise<{ r1: string; r2: string }> {
   const { mkdtempSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
-  const b1 = mkdtempSync(join(tmpdir(), "dba-cA-"));
-  const b2 = mkdtempSync(join(tmpdir(), "dba-cB-"));
+  const b1 = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-cA-")));
+  const b2 = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-cB-")));
   const r1 = join(b1, "shared", "proj"), r2 = join(b2, "shared", "proj");
   await repoAt(r1, "a.ts", yesterdayNoon());
   await repoAt(r2, "b.ts", yesterdayNoon());
@@ -284,9 +286,13 @@ test("T7.3: A has a why, B shares the label and has none ⇒ NEITHER renders [co
   expect(renderBriefing(res.struct).split("\n").filter(isWhyLine).length).toBe(0);
 });
 
-// ── T7.6: the ORDERING assertion — the paired half of T4.9 ──────────────────────────────────────
-// ⚠ T4.9's own receipt could not decide this: the projection did not exist yet, so a synthetic
-// post-scan mutation could not distinguish "after the scan" from "after the projection". THIS is
+// ── T7.6: the ORDERING assertion — the paired half of the former T4.9 ───────────────────────────
+// ⚠ The former T4.9 post-scan-counters test (transcripts-wiring, removed in the 2026-09-24 trim;
+// the T4.9 that remains there is a different test) mutated `counters.drops` DURING
+// generation and checked the persisted record saw it. That could only pin "the write happens after
+// the SCAN's counters are final": red-checked, moving the write up to immediately after
+// `await scanPromise` left it GREEN, because generation runs later still. It could not distinguish
+// "after the scan" from "after the projection" because the projection did not exist yet. THIS is
 // the assertion that does, because `label-collision` is written ONLY by the projection.
 test("T7.6: label-collision survives into the PERSISTED record, so the write runs after the projection", async () => {
   const { r1, r2 } = await collidingRepos();

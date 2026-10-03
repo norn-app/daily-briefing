@@ -5,6 +5,12 @@
 // stay local") and that action never appeared under "Suggested next". Day-43 judge: "any Resume:
 // action must become suggestion #1 or the block is redundant."
 //
+// ⚠ THE SECOND EXEMPLAR IS NO LONGER PROMOTABLE, and that is deliberate (EVAL day 51). "committing
+// THEM" is anaphoric — the files are named only before the marker — so the day-51 rule declines it.
+// It remains the correct illustration of the day-43 DEFECT (an action that never reached the block);
+// it is no longer an example of what this module now emits. The day-51 fire showed why: promoted
+// alone, such a clause points at nothing. See test/day51-anaphoric-promotions.test.ts.
+//
 // Pinned at THREE levels, because an extracted function's own tests let its call site regress
 // invisibly (the precedent is the account-failover review, cited in generator.suggestion-filter):
 //   1. the pure function        — promoteResumeActions
@@ -30,17 +36,29 @@ const S = (text: string) => ({ text });
 // ── 1. Extraction: the marker, its sentence-start rule, and the capture's bounds ─────────────────
 
 test("promoteResumeActions promotes BOTH measured forms: 'Resume: X' and 'resume by X'", () => {
+  // ⚠ FIXTURE CHANGED, INVARIANT NOT (EVAL day 51). The `resume by` case used to read "committing
+  // THEM or confirming they're meant to stay local", which the day-51 anaphor rule now declines —
+  // "them" is the uncommitted files, named only in the clause BEFORE the marker, so promoted alone
+  // it points at nothing. What this test pins is that BOTH MARKER FORMS are recognised, and marker
+  // recognition is untouched by that rule; the old fixture merely happened to use an action that is
+  // now independently disqualified. Keeping it would have turned this into an assertion that
+  // anaphoric actions promote — the exact behaviour being removed. The replacement is the same
+  // sentence with the referent spelled out, so it still exercises `resume by` + the em-dash
+  // sentence-start rule. The decline itself is pinned in its own tests below.
   const out = promoteResumeActions([S("add tests for reduce.ts")], [
     R("wrapped the day-42 pass. Resume: audit day-42 briefing next"),
-    R("the files are still uncommitted — resume by committing them or confirming they're meant to stay local", "/r2"),
+    R("the files are still uncommitted — resume by committing the four STATE.md files or confirming they're meant to stay local", "/r2"),
   ]);
   // PREPENDED, not appended: "must become suggestion #1 or the block is redundant".
   expect(out.map((s) => s.text)).toEqual([
     "audit day-42 briefing next",
-    "committing them or confirming they're meant to stay local",
+    "committing the four STATE.md files or confirming they're meant to stay local",
     "add tests for reduce.ts",
   ]);
   expect(out.map((s) => s.promoted)).toEqual([true, true, undefined]);
+  // And the lane rides along, per-source (day 51): promotions carry their own repo, model-authored
+  // suggestions carry none (they write their own label inline).
+  expect(out.map((s) => s.repo)).toEqual(["/r1", "/r2", undefined]);
 });
 
 test("promoteResumeActions takes the LAST marker, not the first", () => {
@@ -49,7 +67,7 @@ test("promoteResumeActions takes the LAST marker, not the first", () => {
   const out = promoteResumeActions([], [
     R("Resume: rebase the old branch. Resume: publish the installer manifest."),
   ]);
-  expect(out).toEqual([{ text: "publish the installer manifest", promoted: true }]);
+  expect(out).toEqual([{ text: "publish the installer manifest", repo: "/r1", promoted: true }]);
 });
 
 test("promoteResumeActions requires the marker to OPEN a sentence", () => {
@@ -70,13 +88,13 @@ test("boundary: the capture stops at the first sentence terminator, not at end o
   const out = promoteResumeActions([], [
     R("Resume: publish the installer manifest. Then archive the day-42 fixtures and notify the team."),
   ]);
-  expect(out).toEqual([{ text: "publish the installer manifest", promoted: true }]);
+  expect(out).toEqual([{ text: "publish the installer manifest", repo: "/r1", promoted: true }]);
   expect(out[0]!.text).not.toContain("archive");
 });
 
 test("a terminator mid-token (v1.2, day-42.) does not end the capture early", () => {
   const out = promoteResumeActions([], [R("Resume: tag v1.2 and push the release branch")]);
-  expect(out).toEqual([{ text: "tag v1.2 and push the release branch", promoted: true }]);
+  expect(out).toEqual([{ text: "tag v1.2 and push the release branch", repo: "/r1", promoted: true }]);
 });
 
 test("promoteResumeActions SKIPS an over-long capture rather than truncating it", () => {
@@ -90,7 +108,7 @@ test("boundary: an action of 9 chars is ignored, 10 chars is promoted", () => {
   // Kills the MIN_ACTION_CHARS 10→6 mutant.
   expect(promoteResumeActions([], [R("Resume: fix build")])).toEqual([]);            // "fix build"  = 9
   expect(promoteResumeActions([], [R("Resume: fix builds")]))                        // "fix builds" = 10
-    .toEqual([{ text: "fix builds", promoted: true }]);
+    .toEqual([{ text: "fix builds", repo: "/r1", promoted: true }]);
 });
 
 test("promoteResumeActions ignores empty captures and strips trailing . ! ? ,", () => {
@@ -100,9 +118,9 @@ test("promoteResumeActions ignores empty captures and strips trailing . ! ? ,", 
     R("resume by ", "/r3"),
   ])).toEqual([]);
   expect(promoteResumeActions([], [R("Resume: publish the installer manifest,")]))
-    .toEqual([{ text: "publish the installer manifest", promoted: true }]);
+    .toEqual([{ text: "publish the installer manifest", repo: "/r1", promoted: true }]);
   expect(promoteResumeActions([], [R("Resume: publish the installer manifest!")]))
-    .toEqual([{ text: "publish the installer manifest", promoted: true }]);
+    .toEqual([{ text: "publish the installer manifest", repo: "/r1", promoted: true }]);
 });
 
 // ── 2. Coverage: the TWO-GATE rule (containment AND shared-token floor) ──────────────────────────
@@ -137,7 +155,7 @@ test("a 2-token suggestion cannot suppress a promotion on ONE shared word", () =
     R("Resume: publish the installer manifest and run the release checklist"),
   ]);
   expect(out.length).toBe(2);
-  expect(out[0]).toEqual({ text: "publish the installer manifest and run the release checklist", promoted: true });
+  expect(out[0]).toEqual({ text: "publish the installer manifest and run the release checklist", repo: "/r1", promoted: true });
 });
 
 test("promoteResumeActions does not promote the same action twice from two bullets", () => {

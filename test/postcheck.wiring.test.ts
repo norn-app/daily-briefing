@@ -4,9 +4,10 @@
 // was fully green on 2026-08-11 while the checks were, in production, structurally blind to half the
 // RESUME section — because nothing tested the CALL SITE. This file is that missing half: it drives
 // the real `runCore` and asserts the checks see the struct as DELIVERED.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
 import { join } from "node:path";
-import { runCore } from "../src/core";
+import { runCore, STALE_NOTE } from "../src/core";
 import { buildRepo } from "./fixtures/build-repo";
 import { ProviderError, type Config } from "../src/types";
 
@@ -110,25 +111,44 @@ test("postcheck runs ONCE per delivered briefing, not once per provider attempt"
 test("postcheck grades the ANNOTATED suggestion text, not the pre-annotation text", async () => {
   // The second late writer: `annotateStaleSuggestions` rewrites `struct.suggestions` in core.ts
   // after `generateBriefing` returns. At the old call site the text graded was not the text
-  // delivered. This asserts the weaker but checkable half — what postcheck saw is byte-identical to
-  // what shipped — by comparing the finding's quoted suggestion against the final struct.
+  // delivered.
+  //
+  // ⚠ THE FIXTURE MUST ACTUALLY DRIFT. The first version of this test had a clean working tree, so
+  // `annotateStaleSuggestions` returned its input unchanged and "annotated" and "pre-annotation" were
+  // the same bytes — moving the postcheck block back ABOVE the annotation left it green (measured,
+  // 2026-09-24). Here `a.ts` is dirty at extraction and `statusNow` reports a clean tree at the end
+  // of the run, so the suggestion naming `a.ts` gains STALE_NOTE, and the finding must quote THAT.
   const dir = await buildRepo([{ file: "a.ts", content: "x", isoDate: yesterdayNoon() }]);
   await checkoutNewBranch(dir, "fix/escalation-poison-pill");
+  await Bun.write(join(dir, "a.ts"), "x\nchanged\n");          // dirty at extraction time
 
+  // Short on purpose: the finding clips the quoted suggestion at 90 chars, and the note is ~85 of
+  // them. It still restates the code-rendered branch-state line (5 shared tokens over a 6-token
+  // bullet), so the counted rule fires.
   const stub = {
     generate: async () =>
       "## RESUME\n- [x] resume\n## RECAP\n- [x] did it | evidence: HEADSHA\n" +
-      "## SUGGESTIONS\n- Open/push a PR for the `fix/escalation-poison-pill` branch — it still has no upstream.",
+      "## SUGGESTIONS\n- Push `fix/escalation-poison-pill` upstream; see a.ts",
   };
 
   let result: Awaited<ReturnType<typeof runCore>> | undefined;
   const lines = await captureStderr(async () => {
-    result = await runCore(mkCfg([dir]), { provider: stub, netProbe: async () => true });
+    result = await runCore(mkCfg([dir]), {
+      provider: stub, netProbe: async () => true,
+      statusNow: async () => "",                                 // …and clean by the time the run returns
+    });
   });
+
+  // Premise: the annotation really happened, so the two texts differ.
+  const delivered = result!.struct.suggestions[0]!.text;
+  expect(delivered).toContain(STALE_NOTE);
+  expect(delivered.startsWith("Push `fix/escalation-poison-pill` upstream; see a.ts")).toBe(true);
 
   const hit = lines.find((l) => l.startsWith("postcheck [suggestion-restates]"))!;
   expect(hit).toBeDefined();
-  // The delivered suggestion, clipped the way the detail clips it, must appear in the finding.
-  const delivered = result!.struct.suggestions[0]!.text;
-  expect(hit).toContain(delivered.slice(0, 60));
+  // The delivered suggestion, clipped exactly the way the detail clips it (89 chars + "…"), must
+  // appear in the finding — and that clip now reaches INTO the note, so a pre-annotation grade
+  // (which quotes only the 51-char original) cannot satisfy it.
+  expect(hit).toContain(delivered.slice(0, 89));
+  expect(hit).toContain("no longer in the working tree");
 });

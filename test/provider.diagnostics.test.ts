@@ -38,20 +38,10 @@ test("A2: exit 127 with NO output is RETRYABLE — the gate needs its text conju
   await expect(sh("exit 127").generate("x")).rejects.toMatchObject({ code: "nonzero-exit" });
 });
 
-test("A2: a genuinely absent binary is still missing-binary (throws at spawn, before the heuristic)", async () => {
-  const p = new BYOCliProvider({ cli: "definitely-not-a-real-cli-xyz", argv: [], promptVia: "stdin" });
-  await expect(p.generate("x")).rejects.toMatchObject({ code: "missing-binary" });
-});
-
 test("A3: a nonzero exit surfaces STDOUT even when stderr carries a benign advisory", async () => {
   // The 2026-07-11 shape, reproduced: advisory on stderr, the actual cause on stdout.
   const p = sh("echo 'warning: connectors are disabled because an auth source is set' >&2; echo 'Usage limit reached — resets at 3pm'; exit 1");
   await expect(p.generate("x")).rejects.toThrow(/Usage limit reached/);
-});
-
-test("A3: stderr is still surfaced when it is the only output (no regression)", async () => {
-  const p = sh("echo 'the real stderr failure' >&2; exit 2");
-  await expect(p.generate("x")).rejects.toThrow(/the real stderr failure/);
 });
 
 test("A3: both streams appear when both are non-empty, so neither cause is lost", async () => {

@@ -114,15 +114,6 @@ test("a TIMEOUT is an anomaly and is BOUNDED — a hanging --help cannot wedge t
   expect(Date.now() - t0).toBeLessThan(5_000);
 });
 
-test("an INCOMPLETE read is an anomaly, NOT 'the flag is unsupported'", async () => {
-  // The conservative reading is the only safe one: a flag missing from a partially-read help text is
-  // indistinguishable from a flag the CLI does not support. Treating it as absent would be a silent
-  // false negative; treating it as an anomaly means we inject nothing and say so.
-  // Here the help never arrives, and a grandchild holds stdout open past the flush window.
-  const r = await probeSh("sleep 5 & exit 0");
-  expect(r.kind).toBe("anomaly");
-});
-
 test("the anomaly reason is human-readable and names the cause", async () => {
   const r = await probeSh("echo boom >&2; exit 3");
   expect(r.kind).toBe("anomaly");

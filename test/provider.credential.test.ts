@@ -20,12 +20,14 @@
 // they classify it (MATCH/EMPTY/OTHER, see `classify` below), so a REGRESSION cannot print a real
 // credential into a failure message. Both halves are needed: planting keeps the green path honest,
 // classifying keeps the red path safe.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect, spyOn } from "bun:test";
 import { mkdtemp, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BYOCliProvider, withoutKeys } from "../src/provider";
 import { hardenedProvider } from "../src/harden";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const SENTINEL = "sk-test-not-a-real-key";
 /** CLASSIFY the child's view of the key — never echo it. MATCH / EMPTY / OTHER.
@@ -59,7 +61,7 @@ const sh = (opts = {}) =>
 /** A claude-SHAPED fake, so the `shaped` branch in harden.ts is the one under test. `claudeShaped`
  *  keys on the binary's basename, so naming the script `claude` is what makes it shaped. */
 async function claudeShaped(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "dba-cred-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-cred-")));
   const cli = join(dir, "claude");
   // Prints the key it received; `--help` must list the flags so the capability probe stays happy.
   await writeFile(cli, `#!/bin/sh
@@ -220,7 +222,7 @@ test("the PROBE spawn withholds it too — every spawn of the configured CLI, no
   // (CI), and on a developer machine it wrote the developer's REAL key into `log`, where a failing
   // assertion would print it. That is the vacuous-or-inverted trap this file's own header warns
   // about at the top — written there first, then walked into here.
-  const dir = await mkdtemp(join(tmpdir(), "dba-probe-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-probe-")));
   const cli = join(dir, "claude");
   const log = join(dir, "probe-saw.txt");
   // `HOME_EMPTY` here too, not only on the generate path: the probe builds its own env object, so the
@@ -245,7 +247,7 @@ test("the probe passes the key through under env-api-key — the strip is not un
   // The negative twin of the test above. Without it, hard-coding the probe's `envDelete` to
   // WITHHELD_ENV — ignoring `credential` entirely — passes, and an `env-api-key` user's wrapper CLI
   // would silently lose the key on the probe spawn while keeping it on the generate spawn.
-  const dir = await mkdtemp(join(tmpdir(), "dba-probe-thru-"));
+  const dir = removeAtRunEnd(await mkdtemp(join(tmpdir(), "dba-probe-thru-")));
   const cli = join(dir, "claude");
   const log = join(dir, "probe-saw.txt");
   await writeFile(cli, `#!/bin/sh

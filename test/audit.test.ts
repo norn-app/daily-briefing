@@ -1329,7 +1329,9 @@ test("the judge builds its provider from auditJudgeArgv, appended after provider
   // the literal option-object text, which now also carries the account env for failover. An exact-string
   // match here would fail on any additive option and teach the next person to weaken the assertion
   // rather than read it.
-  expect(AUDIT_SRC).toMatch(/hardenedProvider\(judgeCfg, \{[^}]*timeoutMs: 240_000/);
+  // A3 re-pointed the construction at `buildProvider`, the one factory all four sites now use — the
+  // property this line pins (the judge gets its OWN cfg and its OWN long timeout) is unchanged.
+  expect(AUDIT_SRC).toMatch(/buildProvider\(judgeCfg, \{[^}]*timeoutMs: 240_000/);
 });
 
 test("⚠ BOTH models are recorded in the EVAL row — provenance was previously unrecorded entirely", () => {
@@ -1366,6 +1368,55 @@ test("⚠ defect-A wiring: both merge blocks reach the judge's ground truth", ()
   expect(AUDIT_SRC).toMatch(/other merge commit\(s\) on \$\{bDate\}/);
   expect(AUDIT_SRC).toMatch(/prMerges/);
   expect(AUDIT_SRC).toMatch(/otherMerges/);
+});
+
+// ── Wiring pins for the day-47 judge-context fix (user-directed 2026-09-01) ──────────────────────
+// Same class as the defect-A/B pins above, and measured the same way before these existed: gating
+// the squash blocks.push behind if(false), narrowing [...lines, ...postGeneration] to lines alone,
+// un-anchoring the regex, and deleting the prompt's REF REACHABILITY paragraph EACH left the full
+// suite green. The pure pieces are covered; these pin that the assembly actually ships them.
+test("⚠ day-47 wiring: the squash-landed PR block reaches the judge's ground truth", () => {
+  expect(AUDIT_SRC).toMatch(/squash-landed PR-shaped commit\(s\) on \$\{bDate\}/);
+  // ANCHORED, and no (merge) arm — round 1 measured the unanchored form matching mid-subject issue
+  // refs and the optional arm admitting true merges into a "single-parent" heading.
+  expect(AUDIT_SRC).toContain("const squashRe = /\\(#\\d+\\)$/;");
+  // BOTH populations, tagged: post-generation landings are not in the commit list above, and the
+  // day-47 case was one — an untagged single spread re-ships "look one block up" as a false claim.
+  expect(AUDIT_SRC).toMatch(/lines\.filter\(\(l\) => squashRe\.test\(l\)\)/);
+  expect(AUDIT_SRC).toMatch(/postGeneration\.filter\(\(l\) => squashRe\.test\(l\)\)/);
+  expect(AUDIT_SRC).toContain("landed AFTER generation");
+});
+
+test("⚠ day-47 wiring: the unreachable INFO line carries the squash-temporal caveat, still one INFO element", () => {
+  expect(AUDIT_SRC).toContain("Measured NOW, not at generation");
+  expect(AUDIT_SRC).toContain("post-merge ");
+  // Verify round 2: the guidance must not send the judge to evidence outside its prompt — squash
+  // BODIES never enter it (every git log in this codebase is %s-only), so the license to suppress a
+  // loss finding must rest on SUBJECTS and carry the uncertainty escape hatch.
+  expect(AUDIT_SRC).toContain("squash SUBJECTS only, never bodies");
+  expect(AUDIT_SRC).not.toMatch(/message body carries/);
+});
+
+test("⚠ day-47 wiring: buildAuditPrompt's preamble carries the reachability-drift paragraph", () => {
+  // Behavioural, not a source pin — buildAuditPrompt is pure and exported.
+  const p = buildAuditPrompt({ briefing: "B", gitFacts: "G", popup: null, deterministic: [] });
+  expect(p).toContain("REF REACHABILITY likewise reflects NOW");
+  expect(p).toContain("report LOSS only when NO squash-landed commit could carry it");
+  expect(p).toContain("never infer a PR's nonexistence");
+  // Verify round 2's two MEDIUMs, pinned where they lived:
+  //  · no pointer at evidence absent from the prompt (bodies are never fetched — %s-only logs);
+  expect(p).toContain("You see squash SUBJECTS only, not bodies");
+  expect(p).not.toMatch(/body carries/);
+  //  · no unconditional "appear in the COMMIT lists" — post-generation landings do not.
+  expect(p).toContain("POST-generation ones appear ONLY in the");
+  // And the cross-reference names the block's ACTUAL heading (round-1 renamed it).
+  expect(p).toContain(`"squash-landed PR-shaped commit(s)" list`);
+});
+
+test("⚠ day-47 wiring: the squash block's guidance payload itself is pinned (verify round 2 — both sentences were silently deletable)", () => {
+  expect(AUDIT_SRC).toContain("counts only TRUE merge commits");
+  expect(AUDIT_SRC).toContain("corroboration of a PR, not proof");
+  expect(AUDIT_SRC).toContain("does NOT mean no PRs landed");
 });
 
 test("⚠ defect-B wiring: branchAxisText is called with the BRIEFING and appended to gitFactsText", () => {

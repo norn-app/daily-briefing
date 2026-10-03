@@ -15,6 +15,7 @@
 // its named mutation and observing red, and the observed failure is recorded in its comment. Three
 // guards in the three preceding PRs were green-when-written, never mutation-checked, and turned out to
 // pin nothing at all.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect, spyOn } from "bun:test";
 import { BYOCliProvider } from "../src/provider";
 import { ProviderError } from "../src/types";
@@ -119,7 +120,7 @@ function instrumented(maxPulls = 60) {
     // Paced and CAPPED on purpose. An unbounded tight `pull` models the leak faithfully but wedges the
     // runner: with no cancel (the pre-fix state) the loop spins forever and holds the event loop open,
     // so the suite HANGS instead of failing — measured, 6m40s and counting. The cap lets the pre-fix
-    // run terminate and fail honestly; the 5ms pacing leaves a window in which T5 can observe pulls
+    // run terminate and fail honestly; the 5ms pacing leaves a window in which T4 can observe pulls
     // either continuing or frozen.
     async pull(c) {
       if (st.pulls >= maxPulls) { c.close(); return; }
@@ -141,18 +142,24 @@ function fakeSpawn(stdout: ReadableStream<Uint8Array>, stderr: ReadableStream<Ui
   } as unknown as ReturnType<typeof Bun.spawn>;
 }
 
-test("T4: when the flush race is lost, BOTH readers are cancelled", async () => {
-  // T4 and T5 overlap more than intended, and the honest version is worth recording: the flag-only
-  // mutation (an `abandon` that never calls `reader.cancel()`) turns T4 red too, because
-  // `instrumented()`'s `cancel()` hook observes REAL reader cancellation rather than drain's flag. So
-  // T5 kills nothing T4 misses. Kept anyway — it asserts a different property (pulls actually stop),
-  // which is what a future reader needs to see — but it is redundancy, not extra coverage.
+test("T4: when the flush race is lost, BOTH readers are cancelled and actually RELEASED — pulls stop", async () => {
+  // Formerly T4 + T5. They overlapped more than intended, and the honest version is worth recording:
+  // the flag-only mutation (an `abandon` that never calls `reader.cancel()`) turns the cancellation
+  // assertion red on its own, because `instrumented()`'s `cancel()` hook observes REAL reader
+  // cancellation rather than drain's flag. So the pull-freeze check below kills nothing the first
+  // assertion misses — it is kept because it states the property a future reader needs to see
+  // (pulls actually stop), not because it adds coverage. Mutations that go red here: deleting the
+  // `if (!a.sink.complete || !b.sink.complete) { a.abandon(); b.abandon(); }` block in stream.ts,
+  // an `abandon` that drops `reader.cancel()`, and abandoning only `a`.
   const a = instrumented(), b = instrumented();
   const spy = spyOn(Bun, "spawn").mockImplementation(() => fakeSpawn(a.stream, b.stream));
   try {
     await bounded(sh("ignored", { flushMs: 100 }).generate("x"));
   } finally { spy.mockRestore(); }
   expect([a.st.canceled, b.st.canceled]).toEqual([true, true]);
+  const frozen = [a.st.pulls, b.st.pulls];
+  await Bun.sleep(120);
+  expect([a.st.pulls, b.st.pulls]).toEqual(frozen);
 });
 
 test("T4b: a ONE-SIDED hold still cancels the held reader", async () => {
@@ -168,18 +175,6 @@ test("T4b: a ONE-SIDED hold still cancels the held reader", async () => {
     await bounded(sh("ignored", { flushMs: 100 }).generate("x"));
   } finally { spy.mockRestore(); }
   expect(held.st.canceled).toBe(true);
-});
-
-test("T5: cancelling actually RELEASES the reader — pulls stop", async () => {
-  // MUTATION: `abandon = () => { sink.canceled = true; }` (drop `reader.cancel()`) in stream.ts.
-  const a = instrumented(), b = instrumented();
-  const spy = spyOn(Bun, "spawn").mockImplementation(() => fakeSpawn(a.stream, b.stream));
-  try {
-    await bounded(sh("ignored", { flushMs: 100 }).generate("x"));
-  } finally { spy.mockRestore(); }
-  const frozen = [a.st.pulls, b.st.pulls];
-  await Bun.sleep(120);
-  expect([a.st.pulls, b.st.pulls]).toEqual(frozen);
 });
 
 // ─── Step 6: a broken read is not a held pipe. ──────────────────────────────────────────────────────
@@ -249,7 +244,7 @@ test("a TRUNCATED stdout is returned rather than discarded — the fail-open, on
 });
 
 test("the readers are abandoned on the TIMEOUT path too, not only after a clean exit", async () => {
-  // T4/T4b/T5 all reach the `finally` via exit 0. Guarding the abandon with `if (!timedOut)` would
+  // T4/T4b both reach the `finally` via exit 0. Guarding the abandon with `if (!timedOut)` would
   // survive every one of them, and the timeout path is where a held pipe is most likely.
   const held = instrumented();
   const enc = new TextEncoder();
@@ -306,6 +301,13 @@ test("T7b: a ONE-SIDED hold (complete stdout, held stderr) does not warn about t
   // Widening the warn gate to `!o.sink.complete || !e.sink.complete` survives T7 (which asserts only
   // the returned text) and T13 (whose fixtures are held-stdout and clean-EOF). stdout was complete
   // here, so the result is whole and claiming otherwise would be a lie told every morning.
+  //
+  // History (Tier-3 #6, formerly pinned separately in provider.test.ts): sh writes BRIEFING to stdout
+  // then exits; the backgrounded `sleep` (its stdout → /dev/null) inherits ONLY stderr, holding that
+  // pipe open after sh exits. Old code assigned out/err together after Promise.all([stdout,stderr]) →
+  // stderr never EOFs → out stayed "" → a false empty-output even though stdout was fully read.
+  // Originally fixed by assigning each stream independently; since C1 the same property comes from
+  // the sinks being readable mid-flight — which the `out` assertion below still pins.
   const ws: string[] = [];
   const out = await bounded(sh("echo BRIEFING; sleep 3 1>/dev/null &", { flushMs: 150, onWarning: (w: string) => ws.push(w) }).generate("x"));
   expect(out.trim()).toBe("BRIEFING");

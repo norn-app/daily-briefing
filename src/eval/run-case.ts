@@ -6,6 +6,11 @@
 // ground truth and what the pipeline actually windowed is asserted with a thrown Error — a
 // mis-authored gold case is a bug in the case, not a Finding about the product.
 import { buildEvalRepo } from "../../test/fixtures/eval-repo";
+// Registers the transcript root for removal when a `bun test` run ends; inert elsewhere (see
+// test/fixtures/temp-dirs.ts). Static, like the test-side import above: neither reaches the compiled
+// binary because nothing on src/main.ts's import graph imports this file — core.ts's dynamic import of
+// ./eval/checks IS bundled, and checks.ts simply does not import run-case.
+import { removeAtRunEnd } from "../../test/fixtures/temp-dirs";
 import { runCore } from "../core";
 import { run, type RunResult } from "../proc";
 import { INFRA_DENYLIST } from "../subprojects";
@@ -76,6 +81,24 @@ function basename(p: string): string {
 }
 
 
+/** T8.6 — when a synthetic turn and the edit it explains are stamped, relative to `now`.
+ *
+ *  ⚠ Both anchored a few minutes back, and CLOSE TOGETHER. Membership needs the turn to precede the
+ *  first edit AND share its LOCAL DAY; a turn placed hours earlier can cross local midnight, which
+ *  yields `no-qualifying-turn` and a silently vacuous case (measured — a 3-hour offset did).
+ *  ⚠ Even minutes apart they can straddle midnight: for `now` in the first `10 + minutesBeforeEdit`
+ *  minutes after local midnight the edit (now − 10 min) is today and the turn is yesterday, and T8.6
+ *  failed on CI at 00:10 UTC (PR #560, run 36501535951; reproduced on main at 00:12 and 00:14). In that
+ *  case both move to just before that midnight, keeping their spacing — still in the past, still one
+ *  local day, the turn still first. */
+export function evalTranscriptTimes(now: number, minutesBeforeEdit: number): { editAt: string; turnAt: string } {
+  let edit = now - 10 * 60_000;
+  const midnight = new Date(edit);
+  midnight.setHours(0, 0, 0, 0);
+  if (edit - minutesBeforeEdit * 60_000 < midnight.getTime()) edit = midnight.getTime() - 60_000;
+  return { editAt: new Date(edit).toISOString(), turnAt: new Date(edit - minutesBeforeEdit * 60_000).toISOString() };
+}
+
 /** T8.6 — synthesise a transcript corpus for a gold case, against the eval repo's REAL absolute
  *  paths so `unitKeyForAbsolutePath` can bucket them and the join actually runs.
  *
@@ -89,7 +112,7 @@ async function buildEvalTranscripts(
   const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
-  const root = mkdtempSync(join(tmpdir(), "dba-eval-tx-"));
+  const root = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-eval-tx-")));
   const proj = join(root, "-eval-proj");
   mkdirSync(proj, { recursive: true });
 
@@ -101,11 +124,7 @@ async function buildEvalTranscripts(
   });
 
   spec.turns.forEach((t, i) => {
-    // ⚠ Both anchored a few minutes back, and CLOSE TOGETHER. Membership needs the turn to precede
-    // the first edit AND share its LOCAL DAY; a turn placed hours earlier can cross local midnight,
-    // which yields `no-qualifying-turn` and a silently vacuous case (measured — a 3-hour offset did).
-    const editAt = new Date(now - 10 * 60_000).toISOString();
-    const turnAt = new Date(now - (10 + (t.minutesBeforeEdit ?? 5)) * 60_000).toISOString();
+    const { editAt, turnAt } = evalTranscriptTimes(now, t.minutesBeforeEdit ?? 5);
     // `promptSource: "typed"` — a script-produced prompt is excluded by `isAutomatedPrompt`, so a
     // fixture omitting this would silently produce zero whys.
     lines.push({ ...env("user", `u${i}`, turnAt), promptSource: "typed", message: { role: "user", content: t.text } });

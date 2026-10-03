@@ -3,7 +3,7 @@ import { readdir } from "node:fs/promises";
 import type { Activity, Config } from "./types";
 import { DEFAULT_LOOKBACK_CAP_DAYS, DEFAULT_EXCLUDE_COMMIT_PATTERNS, compileExcludePatterns } from "./config";
 import { windowStart, localMidnight } from "./time";
-import { committerDaysWithCommits, listCommits, listPrMerges, patchIds, resumptionSignals, resolveAuthor, gitDirExists, runGit, IncompleteReadError } from "./git";
+import { ancestryRelated, committerDaysWithCommits, listCommits, listPrMerges, patchIds, resumptionSignals, resolveAuthor, gitDirExists, runGit, IncompleteReadError } from "./git";
 import { classify, warnFor, type PathIssue, type GuardOpts } from "./protectedPath";
 import { homedir } from "node:os";
 
@@ -17,7 +17,16 @@ export const fsProbe: RepoProbe = async (repo) => {
   catch (e) { return e as NodeJS.ErrnoException; }
 };
 
-export type ProbeOpts = GuardOpts & { probe?: RepoProbe; gitCheck?: () => Promise<boolean> };
+export type ProbeOpts = GuardOpts & {
+  probe?: RepoProbe; gitCheck?: () => Promise<boolean>;
+  /** Test seams for `dedupeTwins` (IN-1). `patchIds` is the content fingerprint, `ancestryRelated`
+   *  the do-revert-redo discriminator that gates every drop. Both spawn real git, so the window-list
+   *  tests inject counting / empty / throwing stand-ins to pin the cost bound, the call shape and
+   *  BOTH fail-open paths at the `gitActivity` boundary — without a git shim on PATH. Same shape and
+   *  same reason as `gitCheck` above; production never sets either. */
+  patchIds?: typeof patchIds;
+  ancestryRelated?: typeof ancestryRelated;
+};
 
 // Is the `git` binary usable at all? A missing git is systemic (not "no repos") — detect it ONCE.
 // Three outcomes, not two: an IncompleteReadError means git RAN FINE but its output could not be read
@@ -54,7 +63,12 @@ export async function probeRepos(repos: string[], opts?: ProbeOpts): Promise<Pat
 // morning's wall time becomes ~the slowest repo instead of the sum of all. Bounded to avoid a spawn
 // storm (each repo fires several git subprocesses). It also contains blast radius: one repo blocked
 // on dead I/O (a hung network mount) no longer serializes the whole run behind it.
-const REPO_SCAN_CONCURRENCY = 8;
+// EXPORTED (day-20 bidirectional drift re-check): `core.computeWorkingTreeDrift` now re-reads EVERY
+// configured repo at render time, not just the ones already dirty, so it needs the same bound and the
+// same order-preserving walk the extraction scan uses. Sharing the one implementation rather than
+// growing a second copy — a divergent bound would make the render-time re-check either serial (the
+// wall-time regression this file exists to avoid) or unbounded (the spawn storm it exists to avoid).
+export const REPO_SCAN_CONCURRENCY = 8;
 
 // Order-preserving bounded-concurrency map: results[i] always corresponds to items[i] regardless of
 // completion order, so downstream merging stays deterministic — byte-identical to the old sequential
@@ -63,7 +77,7 @@ const REPO_SCAN_CONCURRENCY = 8;
 // Promise.all while other workers run on, which is the intended fail-closed outcome: run() exits
 // without stamping, so the day retries. Every EXPECTED error is still fully guarded, so this path
 // is unreachable in normal operation; it is not the old "fn must not reject" invariant.
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;
   const worker = async () => {
@@ -260,22 +274,157 @@ export async function gitActivity(
   const sameDayMerges = allMerges.filter((m) => new Date(m.timestamp).getTime() >= end.getTime());
   const windowMerges = allMerges.filter((m) => new Date(m.timestamp).getTime() < end.getTime());
 
+  // IN-1 (Phase C; lands under the stacked comparability boundary the user declared 2026-09-17):
+  // `dedupeTwins` ran on the same-day list only since day 33, so a rebase copy's patch-identical
+  // twin still double-rendered in the WINDOW recap — day 34 measured five pairs, 22 items for ~17
+  // changes. Both lists now get the same treatment, and INDEPENDENTLY: a window commit and its
+  // same-day rebase copy stay one-in-each-list exactly as before. Scope extension only — a
+  // cross-list collapse would be a new counting rule, and the same-day call is behaviourally the
+  // one it was (`pid`/`rel` default to the same real implementations; only tests inject anything
+  // else). Round 1 added the ancestry gate, which TIGHTENS both lists equally: a do-revert-redo
+  // trio that the same-day path would have collapsed since day 33 now survives intact.
+  //
+  // WHERE this runs is the load-bearing decision, so it is pinned (test/day33-batch.test.ts): at the
+  // RETURN, upstream of every reader of the window list — `resolveUnits` (`windowCommits`, the S3
+  // share denominator), `reduce` → the prompt and `recapCoverage` (the `▶ What you did — N commits`
+  // header's `total`). Header, coverage drop lines and bullets therefore count ONE population. A
+  // dedupe placed downstream of any of those would re-create the day-49 shape (#424) — a header
+  // that disagrees with its own bullets — this time by exactly the number of twins.
+  const pid = opts?.patchIds ?? patchIds;
+  const rel = opts?.ancestryRelated ?? ancestryRelated;
   return {
-    activities: dedupeSharedRefs(activities), warnings, issues,
-    today: await dedupeTwins(dedupeSharedRefs(today)),
+    activities: await dedupeTwins(dedupeSharedRefs(activities), pid, rel), warnings, issues,
+    today: await dedupeTwins(dedupeSharedRefs(today), pid, rel),
     mergedToday: sameDayMerges, windowMerges, windowStartUtc: start.toISOString(),
   };
 }
 
 /** Defect E (EVAL day 33, user-directed): a rebase-merge copies branch commits onto main with new
  *  SHAs; with the originals still on a stale local branch, `--all` lists BOTH and "Today so far"
- *  double-counts (measured: five patch-identical pairs, 22 items for ~17 changes). Dedupe same-day
- *  commits by `git patch-id --stable` — the exact content fingerprint, which cannot false-positive —
- *  keeping the NEWEST copy per id (rebase copies get fresh committer dates at merge time, so newest
- *  = the mainline copy). Cost-bounded: patch-ids are computed only for commits whose SUBJECT
- *  collides within their repo (a rebase copy keeps its subject verbatim), which is empty on a
- *  normal morning. Fail open: an unmapped SHA (patchIds error) is never dropped. */
-export async function dedupeTwins(items: Activity[], patchIdsFn: typeof patchIds = patchIds): Promise<Activity[]> {
+ *  double-counts (measured: five patch-identical pairs, 22 items for ~17 changes). Dedupe commits by
+ *  `git patch-id --stable` — the exact CONTENT fingerprint — keeping the NEWEST copy per id.
+ *  Cost-bounded: patch-ids are computed only for commits whose SUBJECT collides within their repo (a
+ *  rebase copy keeps its subject verbatim), which is empty on a normal morning. Fail open: an
+ *  unmapped SHA (a `patchIds` failure, or a throw from the injected seam) is never dropped.
+ *
+ *  ⚠ THE FINGERPRINT ALONE FALSE-POSITIVES, and IN-1 round 1 measured it: `feat: add b` →
+ *  `Revert "feat: add b"` → `feat: add b` (re-land) gives copies 1 and 3 the same subject AND the
+ *  same patch-id, because re-landing reproduces the content exactly. Dropping one deletes a commit
+ *  that really happened — the recap then shows a revert of something absent from its own population,
+ *  and `windowCommits` (the S3 denominator) reads one short. So a patch-id match only makes a pair a
+ *  CANDIDATE; `ancestryRelated` then decides. Rebase / cherry-pick / squash copies live on divergent
+ *  histories and are never ancestor-related; a revert-and-reland pair always is. Only a
+ *  NOT-ancestor-related pair is collapsed, and an unknown answer (git error/timeout) keeps both —
+ *  fail open on both legs, since a missed dedupe is cosmetic and a wrong drop is a lost commit.
+ *
+ *  ⚠ NAMED RESIDUAL — THREE COPIES, SURVIVOR-ONLY COMPARISON (IN-1 round 2, documented not fixed).
+ *  The gate is evaluated between each candidate and the CHOSEN SURVIVOR, never pairwise, so a
+ *  patch-id group is treated as ONE equivalence class when it may be several. Failure shape, built
+ *  with real git and reproduced here: original **A** on main → revert → re-land **C** on main, plus a
+ *  stale divergent copy **A2** on a local branch carrying the NEWEST committer date. A2 wins the
+ *  survivor rule; A-vs-A2 and C-vs-A2 both answer "unrelated"; **both real commits are dropped and
+ *  only the stale duplicate survives** — the recap then shows a revert of something absent from its
+ *  own population. Three reasons it is recorded rather than repaired, each checked:
+ *    1. NOT introduced by IN-1. Pre-IN-1 `dedupeTwins` had no gate at all and dropped every copy but
+ *       the newest unconditionally — measured on this exact construction, it produces the IDENTICAL
+ *       outcome (A dropped, C dropped, A2 kept). So this is a pre-existing property of this function
+ *       that the window list now INHERITS, not a new one the window extension creates.
+ *    2. Every obvious repair is a heuristic, not a rule. Partitioning the group into ancestry-
+ *       connected components does not finish the job: in the construction above the components are
+ *       {A,C} and {A2}, and something must still choose between two ancestry-disjoint components.
+ *       "Contains the newest commit" picks {A2} and reproduces the bug exactly. "Largest component"
+ *       happens to pick {A,C} here, but it is a tie-breaker rather than a discriminator — measured,
+ *       one real commit plus TWO stale branch copies gives three patch-identical, mutually
+ *       ancestry-DISJOINT singletons, where it is a 3-way tie and decides nothing. The one
+ *       principled discriminator, default-branch membership, is unavailable for the reason L1
+ *       already records below: `isDefaultBranch` is computed for the BRANCH signal (`git.ts`), and
+ *       commit activities carry no branch membership at all.
+ *    3. Reachability is narrow: it needs THREE patch-identical copies of one change with that
+ *       specific date ordering (the stale one newest). IN-3 measured ZERO twins of any kind on days
+ *       49-52 (`in3-diagnosis-part1.md`), and the worst real shape on record is day 34's five
+ *       patch-identical PAIRS, which this residual does not touch.
+ *  Pinned by `test/day33-batch.test.ts` so a future change to the survivor rule cannot silently
+ *  alter it — that test asserts the CURRENT (lossy) behaviour, and is the place to change if the
+ *  residual is ever repaired.
+ *
+ *  SURVIVOR = the newest committer date, ties broken by the lexicographically smaller SHA (L2: `git
+ *  am -C` and `--committer-date-is-author-date` both make exact ties reachable, and an unstable
+ *  survivor would flip the recap's evidence SHA between runs). That is a DETERMINISTIC rule, not a
+ *  semantic one: a rebase copy usually gets a fresh committer date at merge time, so newest usually
+ *  IS the mainline copy — but a fix cherry-picked FROM `main` ONTO a release branch inverts it and
+ *  the BACKPORT survives (L1). Documented rather than fixed: nothing on a commit Activity records
+ *  branch membership (`meta.isDefaultBranch` is computed for the BRANCH signal in `git.ts`, not
+ *  per commit), so preferring the default-branch copy would cost a `git branch --contains` per
+ *  candidate — real cost for a cosmetic pick between two copies of the SAME change.
+ *
+ *  IN-1 (Phase C, 2026-09-17): applied to the WINDOW list as well as the same-day list — see the
+ *  call site in `gitActivity` for the scope and the header/coverage ordering decision. COST, measured
+ *  under a wide window on synthetic repos (`gitActivity` wall-clock, median of 5; every git spawn
+ *  counted through a PATH shim). `pre` = before IN-1, `r1` = this code:
+ *                                          window commits    git spawns        wall ms
+ *    300 unique subjects                    300 → 300         11 →  11        191 →  185
+ *    300 + five day-34 twin pairs           310 → 305         11 →  31        189 →  432
+ *    144 CONSTANT-subject, one day          144 → 144         11 →  13        153 →  206
+ *    1 real + 432 excluded, 3 days          433 → 433         11 →  13        210 →  308
+ *    30x (add | revert) = 60 commits         60 →  60         11 →  73        147 →  998
+ *  There is NO per-SHA constant any more: `patchIds` batches a whole collision group into 2 spawns
+ *  (git.ts), so the two auto-committer rows cost 2 extra spawns each rather than 2 per commit — the
+ *  round-0 form of this change measured 299 spawns / 3,754 ms and 875 spawns / 11,041 ms on those
+ *  same two rows. What is left scales with CANDIDATE PAIRS, not commits: ≤2 `merge-base
+ *  --is-ancestor` per pair that collided on both subject and patch-id (~14 ms each). The last row is
+ *  that worst case made maximal — every commit in the group patch-identical, 58 ancestry spawns —
+ *  and it is also the row that shows WHY the gate exists: round 0 kept 2 of those 60 commits.
+ *  Round-2 walls are 3-12% above the round-1 numbers this table replaced (182/386/201/289/925) —
+ *  that is the patch-id spool's file create + unlink per collision group, the trade `git.ts` takes
+ *  to keep peak RSS flat. SPAWN COUNTS ARE UNCHANGED, and so is every window-commit count.
+ *  And the tail is now BOUNDED, which it was not: `ANCESTRY_CHECK_CAP` stops each collision group at
+ *  32 checks (≤64 `merge-base` spawns, ~1.0 s) and keeps the whole group, so a revert-cycle repo can
+ *  no longer turn one group into the ~10 s this table's shape extrapolates to at ~380-640 copies.
+ *  The cap does not bind on ANY row above — row 5 measures identically with it removed.
+ *
+ *  Paid TWICE a day, not once: `scripts/audit.ts:386` re-derives ground truth through this same
+ *  `gitActivity` over the same real repos, so every number above lands in the briefing run and again
+ *  in the audit.
+ *
+ *  `meta.excluded` commits DO enter the collision set. Skipping them was proposed and is NOT applied:
+ *  it also touches the same-day path (an excluded same-day pair currently collapses) and so is a user
+ *  decision — and batching has made it moot, since it would now save 2 spawns. It would zero ONE of
+ *  the two auto-committer rows, not both: row 4's subject is excluded (`vault backup: auto`), row 3's
+ *  is `chore: autosave`, which the default `^vault backup:` pattern does not match — a NON-excluded
+ *  constant-subject auto-committer is untouched by that proposal. Row 4 is the structurally MAXIMAL
+ *  shape rather than an artificial one, because `committerDaysWithCommits` filters excluded subjects
+ *  out of the day set: an excluded auto-committer stretches the window to the full `lookbackCapDays`
+ *  instead of collapsing it onto its own busy day. The operator's own vault is neither shape — its
+ *  subjects carry a timestamp (`vault backup: <date> <time>`), so they never collide at all. */
+/** Most `merge-base --is-ancestor` checks `dedupeTwins` will run for ONE collision group before it
+ *  gives up and keeps the whole group (IN-1 round 2). The gate is LINEAR, not quadratic — exactly
+ *  K−1 checks for K patch-identical copies, measured by construction at K = 10/20/40/80 → 9/19/39/79
+ *  — but nothing bounded K, and the wall-clock is real: 290/420/728/1385 ms at those four K, i.e.
+ *  **15.6 ms per extra copy** (one spawn; a pair that is genuinely unrelated tries both directions
+ *  and costs two). Uncapped, ~380-640 patch-identical copies of one change add ~10 s, and
+ *  `scripts/audit.ts:386` re-derives the same ground truth, so it is paid TWICE a day.
+ *
+ *  32 because it bounds the pathology without touching anything real: the worst shape ever measured
+ *  on real history is day 34's five patch-identical PAIRS (one check each), IN-3 measured ZERO twins
+ *  on days 49-52, and the deliberately maximal synthetic row in the cost table below — 30 add/revert
+ *  cycles, 58 `merge-base` spawns — does NOT reach it: that row is identical with the cap removed
+ *  (measured: 60 commits / 73 spawns / 58 is-ancestor either way), as are the other four.
+ *  The guarantee it buys: **≤32 checks ⇒ ≤64 `merge-base` spawns ⇒ ~1.0 s added wall-clock per
+ *  collision group** (32 × 2 × 15.6 ms), against the ~10 s a single large group could previously
+ *  cost. Bounds each GROUP, not the sum over groups — a repo with many distinct colliding subjects
+ *  still pays per group, which is bounded only by the commit count; that axis is unchanged by IN-1
+ *  and is not what this cap is for.
+ *
+ *  Exceeding it keeps EVERY commit in the group, including copies already decided droppable before
+ *  the budget ran out — the same fail-open direction as an unanswered ancestry question. Pinned by
+ *  `test/day33-batch.test.ts`; removing the cap makes that test drop 39 real commits. */
+export const ANCESTRY_CHECK_CAP = 32;
+
+export async function dedupeTwins(
+  items: Activity[],
+  patchIdsFn: typeof patchIds = patchIds,
+  relatedFn: typeof ancestryRelated = ancestryRelated,
+): Promise<Activity[]> {
   const bySubject = new Map<string, Activity[]>();
   for (const a of items) {
     if (a.kind !== "commit" || !a.event_id) continue;
@@ -285,7 +434,18 @@ export async function dedupeTwins(items: Activity[], patchIdsFn: typeof patchIds
   const drop = new Set<string>();
   for (const group of bySubject.values()) {
     if (group.length < 2) continue;
-    const ids = await patchIdsFn(group[0]!.repo ?? "", group.map((a) => a.event_id!));
+    const repo = group[0]!.repo ?? "";
+    // Per-group ancestry budget (IN-1 round 2). Checks are LINEAR in the group — exactly K−1 for K
+    // patch-identical copies, verified by construction at K = 10/20/40/80 — but nothing bounded K,
+    // and the work is paid twice a day (this call and `scripts/audit.ts:386`). See the cap's
+    // rationale and measured worst case at ANCESTRY_CHECK_CAP.
+    let checks = 0;
+    let capHit = false;
+    const groupDrop = new Set<string>();
+    // ONE batched call per collision group (git.ts: 2 spawns, not 2 per SHA). `.catch` because the
+    // seam is injectable and the docstring promises fail-open for a FAILURE, not just an absent SHA:
+    // a throwing provider must degrade to "fingerprint nothing", never abort the briefing (L4).
+    const ids = await patchIdsFn(repo, group.map((a) => a.event_id!)).catch(() => new Map<string, string>());
     const byId = new Map<string, Activity[]>();
     for (const a of group) {
       const id = ids.get(a.event_id!);
@@ -293,17 +453,39 @@ export async function dedupeTwins(items: Activity[], patchIdsFn: typeof patchIds
       byId.set(id, [...(byId.get(id) ?? []), a]);
     }
     for (const twins of byId.values()) {
+      if (capHit) break;
       if (twins.length < 2) continue;
-      const sorted = [...twins].sort((a, b) => new Date(b.timestamp ?? 0).getTime() - new Date(a.timestamp ?? 0).getTime());
-      for (const older of sorted.slice(1)) drop.add(older.event_id!);
+      const sorted = [...twins].sort((a, b) => {
+        const byDate = new Date(b.timestamp ?? 0).getTime() - new Date(a.timestamp ?? 0).getTime();
+        return byDate !== 0 ? byDate : (a.event_id! < b.event_id! ? -1 : 1); // deterministic on a tie
+      });
+      const survivor = sorted[0]!;
+      for (const older of sorted.slice(1)) {
+        if (checks >= ANCESTRY_CHECK_CAP) { capHit = true; break; }
+        checks++;
+        // A patch-id match is only a CANDIDATE. Ancestor-related (a revert-and-reland) → both are
+        // real commits; unknown (git error) → we do not know, so we keep both. Drop ONLY on a
+        // definite `false`. One check per candidate, and only ever for an already-colliding pair.
+        const related = await relatedFn(repo, older.event_id!, survivor.event_id!).catch(() => undefined);
+        if (related !== false) continue;
+        groupDrop.add(older.event_id!);
+      }
     }
+    // Over budget ⇒ this group contributes NOTHING, including the drops already decided before the
+    // cap was reached. Keeping a partially-deduped group would make the output depend on Map
+    // iteration order; keeping ALL of it is the same fail-open direction as an unanswered ancestry
+    // question — never drop on a question we stopped asking.
+    if (!capHit) for (const id of groupDrop) drop.add(id);
   }
-  return drop.size === 0 ? items : items.filter((a) => !(a.event_id && drop.has(a.event_id)));
+  // `drop` is populated from commits only, so the filter states that too: an `event_id` collision
+  // with a non-commit activity is unreachable today (their ids are prefixed) but would otherwise
+  // silently delete an unrelated row (L3).
+  return drop.size === 0 ? items : items.filter((a) => !(a.kind === "commit" && drop.has(a.event_id)));
 }
 
 // Keep the first commit (by SHA=event_id) and the first stash (by its commit SHA); pass genuinely
 // per-worktree activities (uncommitted, branch) through untouched.
-function dedupeSharedRefs(items: Activity[]): Activity[] {
+export function dedupeSharedRefs(items: Activity[]): Activity[] {
   const seenCommit = new Set<string>();
   const seenStash = new Set<string>();
   return items.filter((a) => {

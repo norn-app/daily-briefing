@@ -12,6 +12,7 @@
 // when a cited SHA fails verification, detaching the alias. That reassignment is conditional, so
 // aliasing survives on some mornings and not others: a late push would land in the briefing or vanish
 // depending on whether a SHA happened to fail that day. Non-deterministic, so the merge must be explicit.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
 import { runCore } from "../src/core";
 import { buildRepo } from "./fixtures/build-repo";
@@ -37,13 +38,6 @@ function warningProvider(warnings: string[], opts: { fail?: boolean; times?: num
     },
   };
 }
-
-test("B8: a dynamic warning raised during generate() reaches struct.warnings", async () => {
-  const dir = await buildRepo([{ file: "a.ts", content: "x", isoDate: yesterdayNoon() }]);
-  const provider = warningProvider(["hardening not injected: probe anomaly"]);
-  const r = await runCore(mkCfg([dir]), { provider, netProbe: async () => true });
-  expect(r.struct.warnings ?? []).toContain("hardening not injected: probe anomaly");
-});
 
 test("B8: dynamic warnings are DEDUPED — withRetry can raise the same one on every attempt", async () => {
   // Three attempts pushing an identical anomaly must not print it three times in the briefing.

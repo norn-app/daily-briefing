@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { buildRepo, commitFiles, branchCommit, mergeBranchWith } from "./fixtures/build-repo";
 import { listCommits, listPrMerges, runGit, committerDaysWithCommits, uncommittedFiles, authorArgs, resolveAuthor, uncommittedFileList, resumptionSignals, gitSupportsSinceAsFilter, sinceAsFilterArgs, displayStatusEntry } from "../src/git";
 import { localMidnight } from "../src/time";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 // ---- High ③: windowed-scan helpers (bound the full-history `git log --all` walks) ----
 test("gitSupportsSinceAsFilter: true for git >= 2.37, false below (and on garbage)", () => {
@@ -130,17 +131,23 @@ test("listCommits sees a commit on a branch you've since switched away from (--a
   expect(acts.some((a) => a.event_id === featureSha)).toBe(true);
 });
 
-test("listCommits displays an intermediate-directory rename brace form correctly (src/{old => new}/file.ts)", async () => {
-  // Numstat renders this rename as "src/{old_auth => new_auth}/session.ts" — a brace collapsed
-  // around just the differing segment, with a real suffix ("/session.ts") AFTER the closing
-  // brace. displayFile() must reconstruct "src/new_auth/session.ts", not leave a stray "}" or
-  // drop the "src/" prefix.
+// displayFile() must reconstruct the post-rename path from every shape numstat renders a rename in.
+// Row 1 is the one that first broke: numstat renders "src/{old_auth => new_auth}/session.ts" — a
+// brace collapsed around just the differing segment, with a real suffix ("/session.ts") AFTER the
+// closing brace — and displayFile() must yield "src/new_auth/session.ts", not leave a stray "}" or
+// drop the "src/" prefix. Rows 2 and 3 pin the plain and trailing-brace forms so a fix for row 1
+// cannot regress them.
+test.each([
+  ["intermediate-directory brace form (src/{old => new}/file.ts)", "src/old_auth/session.ts", "src/old_auth", "src/new_auth", "src/new_auth/session.ts"],
+  ["plain 'old => new' (no common prefix/suffix)", "old.txt", "old.txt", "new.txt", "new.txt"],
+  ["trailing brace (dir/{old => new}, no suffix)", "dir/old.txt", "dir/old.txt", "dir/new.txt", "dir/new.txt"],
+])("listCommits displays a rename correctly: %s", async (_name, original, mvFrom, mvTo, expected) => {
   const repo = await buildRepo([
-    { file: "src/old_auth/session.ts", content: "x", isoDate: new Date(2026, 6, 5, 10, 0).toISOString() },
+    { file: original, content: "x", isoDate: new Date(2026, 6, 5, 10, 0).toISOString() },
   ]);
-  await runGit(["mv", "src/old_auth", "src/new_auth"], repo);
+  await runGit(["mv", mvFrom, mvTo], repo);
   const iso = new Date(2026, 6, 6, 10, 0).toISOString();
-  const commit = Bun.spawn(["git", "commit", "-q", "-m", "rename dir"], {
+  const commit = Bun.spawn(["git", "commit", "-q", "-m", "rename"], {
     cwd: repo,
     env: {
       ...process.env, GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso,
@@ -152,55 +159,9 @@ test("listCommits displays an intermediate-directory rename brace form correctly
   const start = localMidnight(new Date(2026, 6, 6));
   const end = localMidnight(new Date(2026, 6, 7));
   const acts = await listCommits(repo, start, end, { emails: ["test@example.com"] });
-  const rename = acts.find((a) => a.text === "rename dir");
+  const rename = acts.find((a) => a.text === "rename");
   expect(rename).toBeDefined();
-  expect((rename!.meta as any)?.diffstat?.[0]?.file).toBe("src/new_auth/session.ts");
-});
-
-test("listCommits still displays a plain 'old => new' rename (no common prefix/suffix) correctly", async () => {
-  const repo = await buildRepo([
-    { file: "old.txt", content: "x", isoDate: new Date(2026, 6, 5, 10, 0).toISOString() },
-  ]);
-  await runGit(["mv", "old.txt", "new.txt"], repo);
-  const iso = new Date(2026, 6, 6, 10, 0).toISOString();
-  const commit = Bun.spawn(["git", "commit", "-q", "-m", "rename file"], {
-    cwd: repo,
-    env: {
-      ...process.env, GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso,
-      GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_EMAIL: "test@example.com",
-    } as any,
-    stdout: "pipe", stderr: "pipe",
-  });
-  await commit.exited;
-  const start = localMidnight(new Date(2026, 6, 6));
-  const end = localMidnight(new Date(2026, 6, 7));
-  const acts = await listCommits(repo, start, end, { emails: ["test@example.com"] });
-  const rename = acts.find((a) => a.text === "rename file");
-  expect(rename).toBeDefined();
-  expect((rename!.meta as any)?.diffstat?.[0]?.file).toBe("new.txt");
-});
-
-test("listCommits still displays a trailing-brace rename (dir/{old => new}, no suffix) correctly", async () => {
-  const repo = await buildRepo([
-    { file: "dir/old.txt", content: "x", isoDate: new Date(2026, 6, 5, 10, 0).toISOString() },
-  ]);
-  await runGit(["mv", "dir/old.txt", "dir/new.txt"], repo);
-  const iso = new Date(2026, 6, 6, 10, 0).toISOString();
-  const commit = Bun.spawn(["git", "commit", "-q", "-m", "rename in dir"], {
-    cwd: repo,
-    env: {
-      ...process.env, GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso,
-      GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_EMAIL: "test@example.com",
-    } as any,
-    stdout: "pipe", stderr: "pipe",
-  });
-  await commit.exited;
-  const start = localMidnight(new Date(2026, 6, 6));
-  const end = localMidnight(new Date(2026, 6, 7));
-  const acts = await listCommits(repo, start, end, { emails: ["test@example.com"] });
-  const rename = acts.find((a) => a.text === "rename in dir");
-  expect(rename).toBeDefined();
-  expect((rename!.meta as any)?.diffstat?.[0]?.file).toBe("dir/new.txt");
+  expect((rename!.meta as any)?.diffstat?.[0]?.file).toBe(expected);
 });
 
 test("committerDaysWithCommits returns local-midnight epoch-ms per commit day, excluding commits older than sinceDaysAgo", async () => {
@@ -321,7 +282,7 @@ test("committerDaysWithCommits does not count a stash-only day as a commit-day (
 });
 
 test("uncommittedFiles returns discrete paths incl. one containing ', '", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "dba-unc-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-unc-")));
   await runGit(["init", "-q", "-b", "main"], dir);
   await runGit(["config", "user.email", "t@e.com"], dir);
   await runGit(["config", "user.name", "T"], dir);
@@ -335,7 +296,7 @@ test("uncommittedFiles returns discrete paths incl. one containing ', '", async 
 });
 
 test("resumptionSignals stores meta.uncommittedFiles on the uncommitted activity", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "dba-unc2-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-unc2-")));
   await runGit(["init", "-q", "-b", "main"], dir);
   await runGit(["config", "user.email", "t@e.com"], dir);
   await runGit(["config", "user.name", "T"], dir);
@@ -351,7 +312,7 @@ test("resumptionSignals stores meta.uncommittedFiles on the uncommitted activity
 test("resumptionSignals: real ahead-N via a bare 'remote' + push -u + a local-only commit, on a CLEAN tree", async () => {
   // Design's named-uncovered git path: a real ahead/behind, computed by git itself against a
   // real upstream — not a hand-built meta.aheadBehind.
-  const bareDir = mkdtempSync(join(tmpdir(), "dba-bare-"));
+  const bareDir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-bare-")));
   await runGit(["init", "-q", "--bare", "-b", "main"], bareDir);
   const repo = await buildRepo([
     { file: "a.txt", content: "a", isoDate: new Date(2026, 6, 6, 9, 0).toISOString() },
@@ -537,7 +498,7 @@ test("⚠ a branch WITH an upstream reports hasUpstream true — the positive ha
   // no-upstream test above still passes (it asserts false). MEASURED: that mutant survived until
   // this case existed. A real clone is the only way to get a genuine upstream.
   const origin = await buildRepo([{ file: "a.txt", content: "a", isoDate: new Date().toISOString() }]);
-  const clone = mkdtempSync(join(tmpdir(), "dba-clone-"));
+  const clone = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-clone-")));
   await Bun.$`git clone -q ${origin} ${clone}`.quiet();
   const b = (await resumptionSignals(clone)).find((a) => a.kind === "branch");
   expect(b?.meta?.hasUpstream).toBe(true);
@@ -552,7 +513,7 @@ test("⚠ origin/HEAD recognises a NON-conventional default (`trunk`) — the he
   // THE test the origin/HEAD mechanism exists for, and it was missing: every prior fixture used a
   // `main` clone, which the main/master fallback also answers true for, so rewriting the ref name so
   // `symbolic-ref` never resolves left the whole mechanism dead with 1020 tests green (MEASURED).
-  const origin = mkdtempSync(join(tmpdir(), "dba-trunk-origin-"));
+  const origin = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-trunk-origin-")));
   await Bun.$`git init -q --bare ${origin}`.quiet();
   // ⚠ The BARE repo's own HEAD must name trunk too. Without this the clone warns "remote HEAD refers
   // to nonexistent ref", checks nothing out, and origin/HEAD comes back UNSET — the fixture then
@@ -562,7 +523,7 @@ test("⚠ origin/HEAD recognises a NON-conventional default (`trunk`) — the he
   await Bun.$`git -C ${seed} branch -M trunk`.quiet();
   await Bun.$`git -C ${seed} remote add origin ${origin}`.quiet();
   await Bun.$`git -C ${seed} push -q -u origin trunk`.quiet();
-  const clone = mkdtempSync(join(tmpdir(), "dba-trunk-clone-"));
+  const clone = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-trunk-clone-")));
   await Bun.$`git clone -q ${origin} ${clone}`.quiet();
   const onTrunk = (await resumptionSignals(clone)).find((a) => a.kind === "branch");
   expect(onTrunk?.target).toBe("trunk");

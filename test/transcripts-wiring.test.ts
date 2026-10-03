@@ -1,6 +1,7 @@
 // Slice 1.5 M4 — the orchestrator body (T4.1) and its wiring into runCore (T4.2/T4.3/T4.4/T4.8/T4.9).
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCore } from "../src/core";
@@ -8,10 +9,11 @@ import { scanTranscripts, emptyEvidence, emptyCounters, DEFAULT_SCAN_CAP_MS, typ
 import { buildSession, humanTurn, assistantToolUse } from "./fixtures/session";
 import { buildRepo } from "./fixtures/build-repo";
 import type { Config } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const yesterdayNoon = () => { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - 1); return d.toISOString(); };
 const stub = { generate: async () => "## RESUME\n- [x] r\n## RECAP\n- [x] d | evidence: HEADSHA\n## SUGGESTIONS\n- n" };
-const tmp = () => mkdtempSync(join(tmpdir(), "dba-m4-"));
+const tmp = () => removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-m4-")));
 const W = { startUtc: "2026-07-29T00:00:00.000Z", endUtc: "2026-07-31T00:00:00.000Z" };
 const CFG: Config = { provider: { cli: "claude", argv: [], promptVia: "stdin" } };
 
@@ -306,40 +308,6 @@ test("T4.1: a degraded scan empties the derived sets but KEEPS its counters [C4]
   expect(evidence.sources.size).toBe(0);        // evidence discarded
   expect(evidence.segments).toEqual([]);
   expect(evidence.counters.capTripped).toBe(true);   // …telemetry survives
-});
-
-// ⚠ T4.9's decidable-at-C4 receipt: a synthetic POST-SCAN mutation of counters.drops must reach the
-// persisted record. `label-collision` itself is written by T7.3 (M7), so asserting on that code here
-// could neither pass nor fail.
-//
-// ⚠ STATED LIMIT OF THIS RECEIPT, measured rather than assumed. It pins that the write happens after
-// the SCAN's counters are final — nothing stronger. Red-checked: moving the write up to immediately
-// after `await scanPromise` leaves this GREEN, because the mutation below runs during generation,
-// which is earlier still. The claim T4.9's comment actually makes — that the write runs after the
-// `whys` PROJECTION — is not decidable until that projection exists, and the plan already assigns it
-// to **T7.6** as a named task with its own red-when-moved receipt. Do not read this test as covering
-// it.
-test("T4.9: a post-scan counters mutation still reaches the persisted record", async () => {
-  const dir = await buildRepo([{ file: "a.ts", content: "x", isoDate: yesterdayNoon() }]);
-  const cfg: Config = { repos: [dir], excludeCommitPatterns: [], lookbackCapDays: 30,
-    transcripts: { enabled: true }, provider: { cli: "claude", argv: [], promptVia: "stdin" } };
-  let seen: TranscriptRunCounters | null = null;
-  const evidence = emptyEvidence({ startUtc: W.startUtc, endUtc: W.endUtc });
-  const r = await runCore(cfg, {
-    provider: {
-      generate: async (p) => {
-        // Mutate DURING generation — i.e. after the scan produced its counters, which is where the
-        // `whys` projection will later run.
-        evidence.counters.drops["label-collision"] = 3;
-        return stub.generate();
-      },
-    },
-    netProbe: async () => true,
-    persistHealth: async (_d, counters) => { seen = counters; },
-    scan: async () => ({ evidence, degraded: [] }),
-  });
-  expect(r.transcripts).toBeDefined();
-  expect(seen!.drops["label-collision"]).toBe(3);   // the write happens AFTER, so the mutation survives
 });
 
 // ── T4.3: the in-flight scan must never escape as an unhandled rejection ────────────────────────

@@ -70,14 +70,20 @@ test("G3: missing RECAP header when ctx has commit activity -> fail", () => {
   const ctx: ReducedContext = {
     repos: [{ repo: "/r", summary: "1 commit", activities: [activity] }],
   };
-  // Missing RECAP header with commits should fail
+  // Missing RECAP header with commits should fail — on the NON-EMPTY rule specifically.
   const input = makeCheckInput({
     rawText: "## RESUME\n- [api] resumed\n## SUGGESTIONS\n- next item\n",
     ctx,
     emptyWindow: false,
   });
   const findings = g3Structure(input);
-  expect(findings.some((f) => f.detail.toUpperCase().includes("RECAP"))).toBe(true);
+  // ⚠ Not `some(detail includes "RECAP")`: the header-presence check above it already emits
+  // "Missing ## RECAP header in rawText" for this fixture, so that predicate was satisfied whether or
+  // not the commit-activity arm ran at all — deleting the `recapLines.length === 0` arm left the old
+  // form green (measured 2026-09-24). Pin the finding this test is named for.
+  expect(findings.map((f) => f.detail)).toContain("RECAP section must be non-empty when ctx has commit activities");
+  expect(findings.map((f) => f.detail)).toContain("Missing ## RECAP header in rawText");
+  expect(findings.every((f) => f.check === "G3" && f.severity === "fail")).toBe(true);
 });
 
 test("G3: empty RECAP that abuts next header (parser mis-bound slice) -> fail", () => {

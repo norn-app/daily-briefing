@@ -1,3 +1,4 @@
+import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 // Slice 1.5 T6.1 — the A3 tool writes NOTHING, anywhere.
 //
 // ⚠ Verified by snapshotting cwd, TMPDIR and supportDir() around a REAL CLI invocation via
@@ -11,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseInspectOptions, formatReport, summarizeOverlap, type Candidate } from "../scripts/inspect-whys";
 import { textSha } from "../src/transcripts/anchor";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 /** Every file under `dir`, with its size and mtime — enough to catch a new OR modified file. */
 function snapshot(dir: string): Map<string, string> {
@@ -34,7 +36,7 @@ const diff = (before: Map<string, string>, after: Map<string, string>) =>
   [...after].filter(([p, v]) => before.get(p) !== v).map(([p]) => p);
 
 test("T6.1: a real CLI invocation creates and modifies NO file in cwd, TMPDIR or the state dir", async () => {
-  const base = mkdtempSync(join(tmpdir(), "dba-a3-"));
+  const base = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-a3-")));
   const cfgDir = join(base, "cfg", "daily-briefing");
   const state = join(base, "state");
   const tx = join(base, "transcripts");

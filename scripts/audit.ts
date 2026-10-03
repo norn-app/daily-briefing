@@ -11,7 +11,7 @@ import { resolveForScript } from "../src/account";
 import { gitActivity } from "../src/extractor";
 import { resolveAuthor, authorArgs, LOCAL_WORK_REFS, IncompleteReadError } from "../src/git";
 import { withRetry } from "../src/provider";
-import { hardenedProvider } from "../src/harden";
+import { buildProvider } from "../src/providerFactory";
 import { postureLine, mergeWarnings } from "../src/eval/posture";
 import { claudeShaped } from "../src/harden";
 import { localDateStr, supportDir, latestBriefingPath, logPath } from "../src/marker";
@@ -235,6 +235,28 @@ async function dayShasAndText(
     // trade one false finding for its mirror image — see PR_MERGE_SUBJECT in src/audit.ts.
     blocks.push(`### ${r} — ${prMerges.length} PR merge(s) on ${bDate}, surfaced by the app's SEPARATE "🔀 Merged #N" channel (NOT recap commits — their absence from the commit list above is BY DESIGN, and a briefing citing one of these is GROUNDED, not fabricating):\n${prMerges.slice(0, 12).join("\n") || "(none)"}${prMerges.length > 12 ? `\n…+${prMerges.length - 12} more` : ""}`);
     blocks.push(`### ${r} — ${otherMerges.length} other merge commit(s) on ${bDate} (plain branch/pull merges). The app surfaces these NOWHERE — neither as recap commits nor via the "🔀 Merged #N" channel — so the briefing is CORRECT to omit them, and a briefing citing one is NOT grounded:\n${otherMerges.slice(0, 12).join("\n") || "(none)"}${otherMerges.length > 12 ? `\n…+${otherMerges.length - 12} more` : ""}`);
+    // Day-47 judge defect (user-directed fix, 2026-09-01): this repo merges PRs by SQUASH, and a
+    // squash lands as an ordinary single-parent commit with a "(#N)" subject suffix — so the
+    // "PR merge(s)" heading (true merge commits only) reads "(none)" on a day when several PRs
+    // landed, and the judge took that heading as exhaustive: "ground truth shows 0 PR merges — no
+    // evidence PR-A2a/A2b exist". Point at the squash-shaped subjects explicitly rather than asking
+    // the judge to infer the convention. Derived from lines/postGeneration verbatim — no second git
+    // call, so this block cannot disagree with the lists it annotates.
+    //   · The regex is ANCHORED to "(#N)" at end-of-subject and EXCLUDES "(merge)"-tagged entries
+    //     (review round 1: the optional (merge) arm admitted true merge commits into a block whose
+    //     heading says single-parent, and an unanchored form matched mid-subject issue refs).
+    //   · Post-generation landings are TAGGED: they are NOT in the commit list above (that list is
+    //     pre-generation lines only; post-generation commits surface via the deterministic
+    //     post-generation note) — and the day-47 case was exactly a post-generation landing, so
+    //     "look one block up" would have been false for the very commits this block exists for.
+    //   · "(#N)" at end-of-subject is GitHub's squash-merge convention but not proof of it — a
+    //     hand-written subject can end with an issue ref. The heading says corroboration, not proof.
+    const squashRe = /\(#\d+\)$/;
+    const squashLanded = [
+      ...lines.filter((l) => squashRe.test(l)),
+      ...postGeneration.filter((l) => squashRe.test(l)).map((l) => `${l} — landed AFTER generation (not in the commit list above; the briefing cannot have known it)`),
+    ];
+    blocks.push(`### ${r} — ${squashLanded.length} squash-landed PR-shaped commit(s) on ${bDate} (single-parent commits whose subject ends "(#N)" — this repo's normal PR landing shape; GitHub appends that suffix on squash-merge, though a subject can end that way for other reasons, so treat as corroboration of a PR, not proof). The "PR merge(s)" heading above counts only TRUE merge commits, so "(none)" there does NOT mean no PRs landed; never infer a PR's nonexistence from that heading alone:\n${squashLanded.slice(0, 12).join("\n") || "(none)"}${squashLanded.length > 12 ? `\n…+${squashLanded.length - 12} more` : ""}`);
   }
   return { shas, text: blocks.join("\n"), postGen, ...bucketFailures(failures), toolchainDetail };
 }
@@ -454,10 +476,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // `shaGround`: the commits are real, the briefing did not hallucinate them, and failing grounding
   // on them would be the false-fabrication verdict PR #140 removed.
   if (sha.unreachable.length) {
+    // Day-47 judge defect (user-directed fix, 2026-09-01): reachability here is measured at AUDIT
+    // time, hours after generation, and the ordinary squash-merge workflow (squash to main, delete
+    // the branch) legitimately orphans the branch's working commits IN THAT GAP — their content
+    // lives on in the squash commit. The judge read exactly that as imminent data loss ("one reflog
+    // expiry from gone") and led its report with it. The line now says which claim is licensed.
     deterministic.push(
       `${INFO}${sha.unreachable.length} cited SHA(s) resolve but are reachable from NO branch or tag — ` +
       `real commits on a deleted/abandoned branch, so a reader following them finds nothing: ` +
-      `${sha.unreachable.join(", ")}. NOT fabrication; the briefing's evidence has become undurable.`);
+      `${sha.unreachable.join(", ")}. NOT fabrication; the briefing's evidence has become undurable. ` +
+      `⚠ Measured NOW, not at generation: a branch squash-merged and deleted since the briefing ran ` +
+      `orphans its commits while their CONTENT lands on the primary branch as a "(#N)" squash ` +
+      `commit. Before reporting these as lost or urgent, check the "squash-landed PR-shaped ` +
+      `commit(s)" list in the ground truth: a squash subject that plausibly covers the same lane ` +
+      `means post-merge cleanup, not loss — and you see squash SUBJECTS only, never bodies, so say ` +
+      `when you are unsure rather than choosing.`);
   }
   // Mirror the app's warning: a bad excludeCommitPatterns regex is silently dropped from the filter,
   // so bot commits could leak into "same-day blindness". Surface it here too (the app warns to stderr).
@@ -483,7 +516,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // would be a local that nothing ever reads. Found by checking, having just written it: exactly the
   // "counter with no reader" class the DropReason coverage table exists to prevent.
   let hardeningOffDrops = 0;
-  // C2: the judge runs on its OWN hardenedProvider, which never passes through runCore — so unlike the
+  // C2: the judge runs on its OWN provider instance, which never passes through runCore — so unlike the
   // briefing's own provider, nothing else would ever surface a probe anomaly or a mid-run hardening latch
   // from it. Collected here so the report can state the posture it judged under.
   const judgeProviders: unknown[] = [];
@@ -518,7 +551,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       // that the INSTRUMENT can change between audits — so the account is recorded in the report below.
       const judgeAcct = await resolveForScript(resolveAccounts(cfg.provider.accounts, homedir()).accounts, new Date());
       judgeAccountLabel = judgeAcct.account?.label;
-      const judgeProvider = hardenedProvider(judgeCfg, { timeoutMs: 240_000, ...(judgeAcct.env ? { env: judgeAcct.env } : {}) });
+      // A3: via the factory, so an API-provider config gets an API judge rather than a spawn of a
+      // synthesized label. `auditJudgeArgv` above still applies only to the CLI shape — argv has no
+      // HTTP analogue — which is why judgeCfg is built the same way and simply carries no extra argv.
+      const judgeProvider = buildProvider(judgeCfg, { timeoutMs: 240_000, ...(judgeAcct.env ? { env: judgeAcct.env } : {}) }).provider;
       judgeProviders.push(judgeProvider);
       judged = await withRetry(() => judgeProvider.generate(
         buildAuditPrompt({ whyGroundTruth, briefing, gitFacts: `${retroNote}${gitFactsText}\n\nCOMMITS ON ${bDate} (same-day, excluded from the briefing window):\n${dayText}`, popup, popupConfigured, deterministic }),

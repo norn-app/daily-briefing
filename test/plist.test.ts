@@ -1,20 +1,28 @@
+// ⚠ RE-POINTED IN SLICE 4 (T2), NOT REWRITTEN. This file used to read
+// `install/local.daily-briefing.plist` off disk. That template is DELETED: it was a second spelling
+// of the unit, unreachable from a downloaded binary (no checkout, no `sed`) and free to drift from
+// whatever the binary itself would write. `launchdPlist()` is now the one source, and every assertion
+// below is the ORIGINAL assertion pointed at it — the same properties, checked against the thing that
+// actually gets installed.
 import { test, expect } from "bun:test";
+import { launchdPlist, type ScheduleOpts } from "../src/schedule/units";
+import { parseFloor } from "../src/schedule";
 
-test("plist ProgramArguments wraps the binary in /usr/bin/caffeinate -i, in order, keeping __BIN__ run", async () => {
-  const plist = await Bun.file("install/local.daily-briefing.plist").text();
-  // Assert the FULL ordered argv, so a reorder (e.g. caffeinate after __BIN__) fails the test.
+/** Stands in for what `schedule install` computes. Paths are literals, not real ones: these tests are
+ *  about the GENERATED TEXT and must not depend on the runner's home directory. */
+const OPTS: ScheduleOpts = {
+  binPath: "/Users/x/Library/Application Support/daily-briefing/daily-briefing",
+  label: "local.daily-briefing",
+  logPath: "/Users/x/Library/Application Support/daily-briefing/briefing.log",
+  floorMinutes: parseFloor("07:20").minutes,
+  intervalSec: 600,
+  pathEnv: "/Users/x/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+};
+
+test("plist ProgramArguments wraps the binary in /usr/bin/caffeinate -i, in order, keeping <bin> run", () => {
+  const plist = launchdPlist(OPTS);
+  // Assert the FULL ordered argv, so a reorder (e.g. caffeinate after the binary) fails the test.
   expect(plist).toMatch(
-    /<string>\/usr\/bin\/caffeinate<\/string>\s*<string>-i<\/string>\s*<string>__BIN__<\/string>\s*<string>run<\/string>/,
+    /<string>\/usr\/bin\/caffeinate<\/string>\s*<string>-i<\/string>\s*<string>\/Users\/x\/Library\/Application Support\/daily-briefing\/daily-briefing<\/string>\s*<string>run<\/string>/,
   );
-});
-
-test("plist uses StartInterval(600)+RunAtLoad, not StartCalendarInterval", async () => {
-  const xml = await Bun.file(`${import.meta.dir}/../install/local.daily-briefing.plist`).text();
-  expect(xml).toContain("<key>StartInterval</key><integer>600</integer>");
-  expect(xml).toContain("<key>RunAtLoad</key><true/>");
-  expect(xml).not.toContain("StartCalendarInterval");
-  // (kept from PR 1: the caffeinate -i wrap-order assertion still passes)
-  expect(xml).toContain("<string>/usr/bin/caffeinate</string><string>-i</string>");
-  expect(xml).toContain("<key>StandardOutPath</key>");
-  expect(xml).toContain("<key>StandardErrorPath</key>");
 });

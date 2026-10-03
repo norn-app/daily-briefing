@@ -7,7 +7,7 @@
 // top suggestion was vacuous at read time — which is the one class of briefing content that is
 // ACTIVELY misleading rather than merely incomplete.
 //
-// The pre-existing pins (`test/main.test.ts:340`, `test/integration.test.ts:195`) only ever asserted
+// The pre-existing pins (`test/main.test.ts:341`, `test/integration.test.ts:196`) only ever asserted
 // that the WARNING STRING appears. Every test here would pass with the annotation deleted, which is
 // exactly how the gap survived — so these are the discriminating cases.
 import { test, expect } from "bun:test";
@@ -16,6 +16,10 @@ import {
   computeWorkingTreeDrift, driftWarnings, annotateStaleSuggestions, workingTreeDriftWarnings,
   mentionsPath, STALE_NOTE,
 } from "../src/core";
+// ⚠ Imported from the EXTRACTOR on purpose. The bidirectional re-check must use the extraction
+// scan's own bound, not a second constant that can drift from it; asserting against the imported
+// symbol is what makes "shared" testable rather than merely commented.
+import { REPO_SCAN_CONCURRENCY } from "../src/extractor";
 
 const dirty = (repo: string, files: string): Activity => ({
   source: "git", kind: "uncommitted", event_id: `${repo}:u`, repo,
@@ -302,7 +306,10 @@ test("⚠ an INFRA path never annotates — the model provably never saw it", as
     meta: { uncommittedFiles: [".claude/worktrees/dba/src/core.ts"] },
   };
   const d = await computeWorkingTreeDrift([a], ["/r"], async () => "");
-  expect(d[0]!.resolved).toEqual([]);
+  // STRONGER than it used to be: a repo whose ONLY delta is an agent worktree now produces no drift
+  // entry at all (round-2 review — the denylist gates the emission, not just `resolved`), so there
+  // is nothing to annotate FROM rather than an entry with an empty `resolved`.
+  expect(d).toEqual([]);
   expect(annotateStaleSuggestions(sug("Refactor core.ts to split the renderer"), d)[0]!.text)
     .not.toContain(STALE_NOTE);
 });
@@ -356,4 +363,221 @@ test("⚠ a MULTI-FILE `now` — the only shape production produces — resolves
   // a.md is FIRST in `now` (startsWith), b.md is MIDDLE (includes), c.md is LAST (endsWith) — all
   // three still dirty. Only d.md actually left the working tree.
   expect(d[0]!.resolved).toEqual(["d.md"]);
+});
+
+// ── the OTHER direction (day-20 finding, two sightings) ──────────────────────────────────────────
+//
+// The re-check walked `uncommitted` — the repos already dirty AT EXTRACTION — so drift was only ever
+// observable dirty→clean. A repo clean at extraction that picked up edits during generation had no
+// entry to iterate and was STRUCTURALLY invisible: not a missed match, an absent loop iteration.
+// Every test above passes with the widening deleted, which is precisely how the gap survived two
+// sightings; these are the discriminating cases.
+
+test("⚠ BIDIRECTIONAL: a repo CLEAN at extraction and DIRTY at re-check now surfaces", async () => {
+  // Zero `uncommitted` activities — under the old walk this could not produce anything at all.
+  const d = await computeWorkingTreeDrift([], ["/r"], async () => "new.md, other.md");
+  expect(d).toHaveLength(1);
+  expect(d[0]!.was).toBe("");
+  expect(d[0]!.now).toBe("new.md, other.md");
+  expect(d[0]!.resolved).toEqual([]);      // nothing was claimed, so nothing can be invalidated
+  const w = driftWarnings(d);
+  expect(w[0]).toContain("working-tree changed while generating: [r]");
+  expect(w[0]).toContain("was clean");     // NOT `was ""`
+  expect(w[0]).toContain(`now "new.md, other.md"`);
+  expect(w[0]).toContain(`re-verify "Where you left off" before acting`);
+});
+
+test("⚠ the clean→dirty direction is a WARNING ONLY — it never annotates a suggestion", async () => {
+  // `resolved` means "was dirty and no longer is". A repo that only GAINED files has an empty `was`,
+  // so it can never mark anything stale — the briefing's content shape is untouched by this half.
+  const d = await computeWorkingTreeDrift([], ["/r"], async () => "src/core.ts");
+  const s = sug("Refactor src/core.ts next", "Ship the release");
+  const out = annotateStaleSuggestions(s, d);
+  expect(out.map((x) => x.text.includes(STALE_NOTE))).toEqual([false, false]);
+});
+
+test("⚠ a repo unchanged at BOTH ends stays silent in either direction", async () => {
+  // clean→clean is the overwhelmingly common case for a configured repo; widening the scan must not
+  // turn every quiet repo into a warning.
+  expect(await computeWorkingTreeDrift([], ["/r"], async () => "")).toEqual([]);
+});
+
+test("⚠ unverifiable stays SILENT for a clean-at-extraction repo too", async () => {
+  // The both-directions half of the "never guess" rule: a `statusNow` that throws yields nothing, so
+  // an unreadable repo cannot manufacture a "you have new uncommitted work" claim either.
+  const d = await computeWorkingTreeDrift([], ["/r"], async () => { throw new Error("git exploded"); });
+  expect(d).toEqual([]);
+});
+
+test("⚠ MIXED: both directions in one run, in repoPaths order, and the quiet repo omitted", async () => {
+  const now: Record<string, string> = { "/a": "", "/b": "gained.md", "/c": "" };
+  const d = await computeWorkingTreeDrift(
+    [dirty("/a", "lost.md")], ["/a", "/b", "/c"], async (repo) => now[repo] ?? "");
+  expect(d.map((x) => x.label)).toEqual(["a", "b"]);   // /c clean at both ends → absent
+  expect(d[0]!.resolved).toEqual(["lost.md"]);          // dirty→clean still propagates
+  expect(d[1]!.resolved).toEqual([]);                   // clean→dirty warns only
+  const w = driftWarnings(d);
+  expect(w[0]).toContain(`was "lost.md"`);
+  expect(w[0]).toContain("now clean (auto-committed?)");
+  expect(w[1]).toContain("was clean");
+});
+
+test("⚠ a dirty repo OUTSIDE repoPaths is still re-checked — the widening must not narrow", async () => {
+  // The scan set is the UNION. Iterating `repoPaths` alone would silently drop an uncommitted
+  // activity whose repo the caller did not list, turning this fix into a regression for the very
+  // direction it is meant to preserve.
+  const d = await computeWorkingTreeDrift([dirty("/elsewhere", "a.md")], ["/r"], async (repo) =>
+    repo === "/elsewhere" ? "" : "");
+  expect(d.map((x) => x.label)).toEqual(["elsewhere"]);
+  expect(d[0]!.resolved).toEqual(["a.md"]);
+});
+
+test("⚠ INFRA paths are still dropped after the widening", async () => {
+  // The denylist filter moved inside the concurrent callback; it is the one invariant the rewrite
+  // could have silently lost, and losing it marks live agent-scratch work "already committed".
+  const a: Activity = {
+    source: "git", kind: "uncommitted", event_id: "r:u", repo: "/r",
+    text: "Uncommitted changes: .claude/worktrees/dba/src/core.ts, real.md",
+    meta: { uncommittedFiles: [".claude/worktrees/dba/src/core.ts", "real.md"] },
+  };
+  const d = await computeWorkingTreeDrift([a], ["/r", "/other"], async () => "");
+  expect(d.map((x) => x.label)).toEqual(["r"]);   // /other was and is clean
+  expect(d[0]!.resolved).toEqual(["real.md"]);    // the infra path dropped, the real one kept
+});
+
+test("⚠ one status read per repo even when a repo carries two uncommitted activities", async () => {
+  // The old walk emitted one drift PER ACTIVITY; the new one is keyed by repo. A duplicate entry
+  // must not double-read git nor double-warn about the same working tree.
+  const calls: string[] = [];
+  const d = await computeWorkingTreeDrift(
+    [dirty("/r", "a.md"), dirty("/r", "b.md")], ["/r"],
+    async (repo) => { calls.push(repo); return ""; });
+  expect(calls).toEqual(["/r"]);
+  expect(d).toHaveLength(1);
+});
+
+test("⚠ the re-check is BOUNDED-CONCURRENT — not serial, not unbounded", async () => {
+  // The extraction scan already ruled that per-repo git reads must not serialize (one repo on a hung
+  // mount would hold the whole run behind it). This re-check runs at the very END of a run, after the
+  // model call, over EVERY configured repo — the worst possible place to re-introduce a serial walk.
+  //
+  // ⚠ A BARRIER, NOT A SLEEP, and the floor is a REACHED flag rather than `max === bound` (round-2
+  // review). The first version slept 2ms per probe and asserted `max` EQUALLED the bound: on a
+  // loaded host a worker can be descheduled between its increment and the next worker's, so `max`
+  // measures BELOW the bound and the test goes red for a reason that has nothing to do with the
+  // code — the exact intermittent class docs/flake-chase-2026-09-15.md was written about. Here no
+  // probe can return until `REPO_SCAN_CONCURRENCY` of them are simultaneously in flight, so the
+  // floor is established by construction under any load; the safety valve turns a bound that can
+  // NEVER reach the barrier (a serial walk) into a clean assertion failure instead of a hang.
+  // Discriminating power is unchanged in both directions: `reached` kills serial/limit-1, and
+  // `<= bound` kills unbounded, where 24 concurrent probes would be measured as 24.
+  const repos = Array.from({ length: REPO_SCAN_CONCURRENCY * 3 }, (_, i) => `/r${i}`);
+  let release!: () => void;
+  const opened = new Promise<void>((r) => { release = r; });
+  const valve = setTimeout(() => release(), 2_000);
+  let inFlight = 0, max = 0, reached = false;
+  await computeWorkingTreeDrift([], repos, async () => {
+    inFlight++; max = Math.max(max, inFlight);
+    if (inFlight >= REPO_SCAN_CONCURRENCY) { reached = true; release(); }
+    await opened;
+    inFlight--;
+    return "";
+  });
+  clearTimeout(valve);
+  expect(reached).toBe(true);                             // FLOOR: the shared bound is actually reached
+  expect(max).toBeLessThanOrEqual(REPO_SCAN_CONCURRENCY); // CEILING: never exceeds it — NOT unbounded
+});
+
+test("⚠ order is repoPaths order, NOT status-completion order", async () => {
+  // `mapLimit` is order-preserving; a `Promise.all(map(...))`-with-push rewrite would emit whichever
+  // repo's `git status` returned first, making the warning block non-deterministic across runs.
+  const delay: Record<string, number> = { "/a": 30, "/b": 1, "/c": 15 };
+  const d = await computeWorkingTreeDrift([], ["/a", "/b", "/c"], async (repo) => {
+    await new Promise((r) => setTimeout(r, delay[repo] ?? 0));
+    return "gained.md";
+  });
+  expect(d.map((x) => x.label)).toEqual(["a", "b", "c"]);
+});
+
+// ── the denylist gates EMISSION and RENDER, not just `resolved` ───────────────────────────────────
+//
+// Round-2 review finding. The filter was applied to `wasFiles` only, so the DECISION to emit was
+// `now === was` on the raw `git status` strings and the printed `was`/`now` were raw too. While only
+// already-dirty repos were re-read that was invisible; once every contributing repo is re-read, an
+// agent worktree appearing in an otherwise-clean repo is enough to tell the reader their pending
+// work changed. `resolveUnits` (subprojects.ts) and `applySuggestionGuards` (generator.ts) already assert that the model PROVABLY
+// never saw an INFRA path, so a warning built on one is a claim about work the briefing never made.
+
+test("⚠ INFRA-ONLY delta in a clean repo emits NOTHING (denylist gates the EMISSION)", async () => {
+  // The case the first INFRA test could not fail: it asserted `d[0].resolved`, which requires an
+  // entry to exist. With the emission path unfiltered this returns one drift and a warning.
+  expect(await computeWorkingTreeDrift([], ["/r"], async () => ".claude/worktrees/dba/src/core.ts"))
+    .toEqual([]);
+});
+
+test("⚠ INFRA-ONLY delta in a DIRTY repo emits NOTHING either — both sides are filtered", async () => {
+  // Same shape in the dirty→? direction: the real file is dirty at both ends and only an agent
+  // worktree came or went. Filtering one side alone would leave `was !== now` and warn.
+  const a: Activity = {
+    source: "git", kind: "uncommitted", event_id: "r:u", repo: "/r",
+    text: "Uncommitted changes: .claude/worktrees/x/a.ts, real.md",
+    meta: { uncommittedFiles: [".claude/worktrees/x/a.ts", "real.md"] },
+  };
+  expect(await computeWorkingTreeDrift([a], ["/r"], async () => "real.md")).toEqual([]);
+});
+
+test("⚠ a REAL delta still surfaces, with the INFRA path stripped from the printed sides", async () => {
+  // Filtering must not swallow the finding — only the agent-scratch noise inside it. The reader is
+  // shown the files they can act on, never `.claude/worktrees/...`.
+  const d = await computeWorkingTreeDrift([], ["/r"], async () => ".claude/worktrees/x/a.ts, new.md");
+  expect(d).toHaveLength(1);
+  expect(d[0]!.now).toBe("new.md");                       // the infra entry is not printed
+  expect(driftWarnings(d)[0]).not.toContain(".claude/worktrees");
+  expect(driftWarnings(d)[0]).toContain(`now "new.md"`);
+});
+
+test("⚠ an uncommitted activity with an EMPTY file list behaves exactly like a clean repo", async () => {
+  // Adjudicating the empty-string-vs-clean confusion raised in review: `was` is "" for BOTH a repo
+  // with no activity and an activity carrying no files, and the two must stay indistinguishable —
+  // an empty measurement is a measurement of nothing pending, in either shape.
+  const empty: Activity = {
+    source: "git", kind: "uncommitted", event_id: "r:u", repo: "/r",
+    text: "Uncommitted changes: ", meta: { uncommittedFiles: [] },
+  };
+  expect(await computeWorkingTreeDrift([empty], ["/r"], async () => "")).toEqual([]);
+  const d = await computeWorkingTreeDrift([empty], ["/r"], async () => "new.md");
+  expect(d).toHaveLength(1);
+  expect(d[0]!.was).toBe("");
+  expect(driftWarnings(d)[0]).toContain("was clean");     // not `was ""`
+  expect(d[0]!.resolved).toEqual([]);
+});
+
+// ── the clean→dirty AUDIENCE is the repos that contributed ───────────────────────────────────────
+
+test("⚠ a DISCOVERY-ONLY repo going clean→dirty produces NO warning", async () => {
+  // Discovery walks two levels under each root, so a typical home directory configures dozens of
+  // repos the author-filtered briefing never mentions. A build artefact landing in one of them must
+  // not advise re-verifying a "Where you left off" section that says nothing about it.
+  const d = await computeWorkingTreeDrift([], ["/contrib", "/vendored"], async () => "out.log",
+    ["/contrib"]);
+  expect(d.map((x) => x.label)).toEqual(["contrib"]);
+});
+
+test("⚠ a non-contributing repo that was DIRTY at extraction is still re-checked", async () => {
+  // The two directions have different audiences on purpose: dirty→clean invalidates a claim the
+  // briefing already made (its files can annotate a suggestion), so it keeps the wider audience.
+  const d = await computeWorkingTreeDrift([dirty("/vendored", "a.md")], ["/contrib", "/vendored"],
+    async () => "", ["/contrib"]);
+  expect(d.map((x) => x.label)).toEqual(["vendored"]);
+  expect(d[0]!.resolved).toEqual(["a.md"]);
+});
+
+test("⚠ a non-contributing repo is never even PROBED", async () => {
+  // Not just silent — unspawned. The re-check runs at the very end of a run, after the model call;
+  // each `git status` is bounded only by GIT_TIMEOUT_MS (30s), so probing repos that can contribute
+  // no trustworthy measurement is wall time paid for nothing.
+  const probed: string[] = [];
+  await computeWorkingTreeDrift([], ["/contrib", "/vendored"],
+    async (repo) => { probed.push(repo); return ""; }, ["/contrib"]);
+  expect(probed).toEqual(["/contrib"]);
 });

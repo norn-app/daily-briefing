@@ -22,6 +22,7 @@ import { test, expect, spyOn } from "bun:test";
 import { gitActivity } from "../src/extractor";
 import { IncompleteReadError } from "../src/git";
 import { buildRepo } from "./fixtures/build-repo";
+import { fastGitFlush } from "./fixtures/git-flush";   // held-pipe tests only — see the fixture header
 import { blockedDelivery } from "../src/core";
 import { isInaccessible } from "../src/protectedPath";
 import type { Config } from "../src/types";
@@ -62,6 +63,7 @@ const cfg = (over: Partial<Config> = {}): Config =>
 test("an incomplete read BLOCKS THE STAMP — a warning alone is not enough", async () => {
   const repo = await buildRepo([{ file: "a.txt", content: "a", isoDate: new Date().toISOString() }]);
   const spy = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => heldSpawn(cmd)) as any);
+  const flush = fastGitFlush();   // the held fake never EOFs, so the window is pure wait
   try {
     const { activities, issues } = await gitActivity(cfg(), [repo]);
     expect(activities).toHaveLength(0);
@@ -70,7 +72,7 @@ test("an incomplete read BLOCKS THE STAMP — a warning alone is not enough", as
     // the day and never retries: the fabricated quiet day A1 calls worse than the hang.
     expect(issues.some(isInaccessible)).toBe(true);
     expect(blockedDelivery(activities.length, issues)).toBe(true);
-  } finally { spy.mockRestore(); }
+  } finally { flush.restore(); spy.mockRestore(); }
 });
 
 test("a held repo alongside a HEALTHY one still delivers — only an empty run blocks", async () => {
@@ -238,12 +240,13 @@ test("the incomplete-read repo is NOT reported as readable (so it can't be silen
   // would have hit the same held pipe and appended its own "partial read of" pair.
   const repo = await buildRepo([{ file: "a.txt", content: "a", isoDate: new Date().toISOString() }]);
   const spy = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => heldSpawn(cmd)) as any);
+  const flush = fastGitFlush();   // the held fake never EOFs, so the window is pure wait
   try {
     const { warnings, issues } = await gitActivity(cfg(), [repo]);
     expect(issues).toEqual([{ path: repo, kind: "unreadable" }]);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(`skipped ${repo}`);   // phase 1's wording, not phase 2's
-  } finally { spy.mockRestore(); }
+  } finally { flush.restore(); spy.mockRestore(); }
 });
 
 test("a genuinely empty repo (unborn HEAD) yields NO issue — an incomplete read must stay distinguishable from it", async () => {
@@ -273,6 +276,7 @@ test("a machine-wide held pipe is diagnosed as such — NOT as \"git isn't runna
   // error's own `reason` (see gitAvailable) — this test pins that.
   const repo = await buildRepo([{ file: "a.txt", content: "a", isoDate: new Date().toISOString() }]);
   const spy = spyOn(Bun, "spawn").mockImplementation((() => fake(["partial"], false)) as any); // blanket hold, incl. --version
+  const flush = fastGitFlush();   // the held fake never EOFs, so the window is pure wait
   try {
     const { issues, warnings } = await gitActivity(cfg(), [repo]);
     expect(issues.some(isInaccessible)).toBe(true);                  // still BLOCKING — mere presence of
@@ -280,7 +284,7 @@ test("a machine-wide held pipe is diagnosed as such — NOT as \"git isn't runna
     expect(warnings.join(" ")).not.toContain("not on PATH");        // the wrong diagnosis
     expect(warnings.join(" ")).toContain("could not be read to completion");   // the right one
     expect(warnings.join(" ")).toContain("holding git's output pipe open");     // the probe's reason, plumbed
-  } finally { spy.mockRestore(); }
+  } finally { flush.restore(); spy.mockRestore(); }
 });
 
 test("IncompleteReadError is exported and identifiable across module boundaries", () => {

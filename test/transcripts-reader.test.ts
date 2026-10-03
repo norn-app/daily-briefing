@@ -4,9 +4,10 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readJsonl, emptyTally, MAX_LINE_CHARS, LINES_PER_SLICE } from "../src/transcripts/reader";
+import { readJsonl, emptyTally, MAX_LINE_CHARS } from "../src/transcripts/reader";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
-const tmp = () => mkdtempSync(join(tmpdir(), "dba-rd-"));
+const tmp = () => removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-rd-")));
 const EVENT_LOOP_BOUND_MS = 50; // the plan's chosen bound (§3.2); the OBSERVED value is measured below
 
 async function drain(path: string) {

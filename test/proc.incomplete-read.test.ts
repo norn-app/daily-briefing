@@ -15,6 +15,11 @@
 // (a spawn throw has always mapped to -1), and both existing call sites already gate on it. That
 // makes the safe behaviour the one you get without an edit: a caller that never reads `complete`
 // still cannot mistake a partial read for success.
+//
+// The fixture import is for isolation.meta.test.ts's scanner 6. The SIGNAL-killed test below runs
+// `run(["bun", "run", "src/main.ts"])` against a mocked Bun.spawn. The scanner cannot see the mock, and
+// the import is what it asks of every file that hands `run()` an entry.
+import "./fixtures/isolate-state";
 import { test, expect, spyOn } from "bun:test";
 import { run, DEFAULT_FLUSH_MS, DEFAULT_TIMEOUT_MS } from "../src/proc";
 
@@ -90,24 +95,16 @@ test("run() returns the output and exit code for a normal, fully-EOF'd invocatio
   } finally { spy.mockRestore(); }
 });
 
-test("run() does NOT HANG when the child exits 0 but stdout never EOFs — the F2 bug", async () => {
-  // Before the fix this never returns: `.text()` resolves only at EOF and nothing raced it.
-  const spy = spyOn(Bun, "spawn").mockImplementation(() =>
-    fakeSpawn({ stdout: neverEofStream(["partial output"]), stderr: eofStream([]) }));
-  try {
-    const r = await bounded(run(["git", "log"], { flushMs: 50 }));
-    expect(r.complete).toBe(false);
-  } finally { spy.mockRestore(); }
-});
-
 test("an incomplete stdout forces code = -1 EVEN THOUGH the child exited 0 — the fail-safe mapping", async () => {
+  // Also the F2 no-hang pin: before the fix this never returned at all — `.text()` resolves only at
+  // EOF and nothing raced it — so `bounded` returning with `complete: false` is the first property.
   // The contract that makes this fix work without editing every call site. Both existing consumers
   // gate on `code` (`dayShasAndText`'s `code !== 0` skip and `checkShas`'s `code === 0` — by symbol,
   // since the line numbers this comment first cited were stale on arrival), so mapping an incomplete
   // read onto the already-honoured failure sentinel routes it into their failure branch with no edit
   // — and a FUTURE call site that never reads `complete` still cannot mistake partial output
-  // for success. Pinned separately from the no-hang test above: returning `complete: false` while
-  // leaving `code: 0` would satisfy that test and still fabricate a quiet day at every call site.
+  // for success. Returning `complete: false` while leaving `code: 0` would satisfy the no-hang
+  // property alone and still fabricate a quiet day at every call site.
   const spy = spyOn(Bun, "spawn").mockImplementation(() =>
     fakeSpawn({ stdout: neverEofStream(["3 commits worth of log output"]), stderr: eofStream([]), exitCode: 0 }));
   try {
@@ -380,17 +377,6 @@ test("the DEFAULT flush window is used when none is given, and is neither 0 nor 
   } finally { spy.mockRestore(); }
 });
 
-test("REAL process: a child that never exits is bounded by the timeout, not hung forever", async () => {
-  // The other route to the SAME user-visible symptom F2 fixes: the flush race is only entered AFTER
-  // `p.exited`, so without a spawn timeout a wedged child (an unresponsive network mount, a blocking
-  // git hook) hangs the audit exactly as the held pipe did. `runGit` bounds the same binary over the
-  // same repos at 30s; this had neither `timeout` nor `killSignal`.
-  const t0 = Date.now();
-  const r = await bounded(run(["sleep", "30"], { timeoutMs: 400 }), 10_000);
-  expect(Date.now() - t0).toBeLessThan(5_000);
-  expect(r.code).not.toBe(0);
-});
-
 test("the DEFAULT timeout exists and is sane — the hang guard must not be removable", async () => {
   // Measured: deleting `timeout: … ?? DEFAULT_TIMEOUT_MS` left the whole suite green, because the only
   // timeout test passed `timeoutMs` explicitly and nothing imported the constant. That mutation
@@ -400,8 +386,12 @@ test("the DEFAULT timeout exists and is sane — the hang guard must not be remo
 });
 
 test("REAL process: a TERM-IGNORING child is still killed — killSignal must be SIGKILL", async () => {
-  // Measured: removing `killSignal: "SIGKILL"` also left the suite green, because the existing timeout
-  // test uses `sleep`, which dies to Bun's default SIGTERM. A child that traps TERM — a wedged git
+  // The timeout is the other route to the SAME user-visible symptom F2 fixes: the flush race is only
+  // entered AFTER `p.exited`, so without a spawn timeout a wedged child (an unresponsive network
+  // mount, a blocking git hook) hangs the audit exactly as the held pipe did. `runGit` bounds the same
+  // binary over the same repos at 30s; `run()` had neither `timeout` nor `killSignal`.
+  // Measured: removing `killSignal: "SIGKILL"` also left the suite green, because the earlier timeout
+  // test used `sleep`, which dies to Bun's default SIGTERM. A child that traps TERM — a wedged git
   // hook is the scenario proc.ts's own comment names — would then never die, `await p.exited` would
   // never resolve, and the F2 symptom returns by yet another route.
   const t0 = Date.now();

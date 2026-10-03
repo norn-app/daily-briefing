@@ -2,6 +2,7 @@
 // dropped at the git layer, so a bot commit can still vote for a sub-project root and mark window
 // content. Every consumer downstream must ignore it. These pins are written to go RED if the
 // retention leaks into a consumer it must not reach — each one discriminates, none is trivially true.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +12,7 @@ import { orderResumeByRank } from "../src/generator";
 import { runCore } from "../src/core";
 import { buildRepo } from "./fixtures/build-repo";
 import type { Activity, Config, BriefingStruct } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 // `ResumeLine` is a private alias in generator.ts — derive it the same way rather than widening its API.
 type ResumeLine = BriefingStruct["resume"][number];
@@ -26,7 +28,7 @@ const commit = (repo: string, id: string, iso: string, file: string, excluded?: 
 // be order-stable for the wrong reason), and the excluded commit is the NEWEST thing in the repo —
 // so admitting it into `u.commits` flips alpha ahead of beta, in rankUnits AND in the RESUME order.
 test("T0.2: an excluded commit does not enter u.commits, so it cannot re-rank a unit", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "dba-t02-rank-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-t02-rank-")));
   for (const d of ["alpha", "beta"]) mkdirSync(join(repo, d), { recursive: true });
   const cfg: Config = { ...CFG, subprojects: [{ repo, roots: ["alpha", "beta"] }] };
 
@@ -61,7 +63,7 @@ test("T0.2: an excluded commit does not enter u.commits, so it cannot re-rank a 
 // comes from `repoLabelFor(repo, repos)`, which qualifies against the full REPO list and so would not
 // discriminate this behaviour at all.)
 test("T0.2: an excluded-only unit never reaches labelUnits, so it cannot qualify a sibling's label", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "dba-t02-label-"));
+  const repo = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-t02-label-")));
   for (const d of ["alpha/core", "beta/core"]) mkdirSync(join(repo, d), { recursive: true });
   const cfg: Config = { ...CFG, subprojects: [{ repo, roots: ["alpha/core", "beta/core"] }] };
 

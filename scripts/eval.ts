@@ -21,7 +21,7 @@
 import { loadConfig, resolveAccounts } from "../src/config";
 import { resolveForScript } from "../src/account";
 import { homedir } from "node:os";
-import { hardenedProvider } from "../src/harden";
+import { buildProvider } from "../src/providerFactory";
 import type { Provider } from "../src/types";
 import { postureLine, posturePhrase, mergeWarnings, isTruncationWarning } from "../src/eval/posture";
 import { runCase } from "../src/eval/run-case";
@@ -133,9 +133,13 @@ async function main() {
     // through runCore with an INJECTED provider, and runCore's recording is gated on having built the
     // provider itself, precisely so a developer's eval cannot write a user-facing outage into live state.
     const evalAcct = await resolveForScript(resolveAccounts(realCfg.provider.accounts, homedir()).accounts, new Date());
-    const caseProvider = hardenedProvider(realCfg.provider, {
+    // A3: ONE factory for all four construction sites, so the eval measures the transport production
+    // uses. `.provider` rather than the whole BuiltProvider: nothing here drives the hardening ladder
+    // (that lives in runCore), and keeping the binding a plain Provider leaves every line below
+    // unchanged. B10's invariant is enforced statically by test/posture.test.ts.
+    const caseProvider = buildProvider(realCfg.provider, {
       timeoutMs: realCfg.provider.timeoutMs, ...(evalAcct.env ? { env: evalAcct.env } : {}),
-    });
+    }).provider;
     try {
       const { attempts, verdict } = await runOneCase(gc, caseProvider);
       const findings = attempts.flatMap((a) => a.findings);
@@ -167,9 +171,9 @@ async function main() {
         // the account is recorded in the row rather than left implicit.
         const judgeAcct = await resolveForScript(resolveAccounts(realCfg.provider.accounts, homedir()).accounts, new Date());
 
-        const judgeProvider = hardenedProvider(realCfg.provider, {
+        const judgeProvider = buildProvider(realCfg.provider, {
           timeoutMs: 240_000, ...(judgeAcct.env ? { env: judgeAcct.env } : {}),
-        });
+        }).provider;
         try {
           const judged = await runJudge(gc, judgeProvider, attempts[0]!);
           // The judge runs on its OWN provider instance which never passes through runCore, so unlike the

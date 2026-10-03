@@ -1,3 +1,4 @@
+import "./fixtures/isolate-state";   // armed before this file's first save, from any cwd (see test/fixtures/isolate-state.ts)
 // Tick heartbeat (day-34 finding, 2026-08-19, user-directed): every scheduled invocation must leave
 // a trace BEFORE any gate, so "launchd never fired" and "a tick fired and returned at a gate" stop
 // being indistinguishable — the ambiguity that left day 34's 110-minute first-wake gap undiagnosable.
@@ -26,14 +27,6 @@ describe("stampTick", () => {
     // today=11 proves the gate is the defect; today=1 proves launchd was not firing.
     for (let i = 0; i < 11; i++) await stampTick(`2026-08-20T0${i < 10 ? i : 9}:00:00.000Z`, "2026-08-20");
     expect((await Bun.file(tickPath()).text()).trim()).toMatch(/ today=11$/);
-  });
-
-  test("a new local date RESETS the count rather than accumulating forever", async () => {
-    // ⚠ Note what this case does NOT cover: every stamp's UTC date already equals its local date, so
-    // it passed under the day-35 defect too. The UTC-vs-local block below is what discriminates.
-    await stampTick("2026-08-20T23:50:00.000Z", "2026-08-20");
-    await stampTick("2026-08-20T23:55:00.000Z", "2026-08-20");
-    expect(await stampTick("2026-08-21T00:05:00.000Z", "2026-08-21")).toBe(1);
   });
 
   test("an unparseable existing line starts over instead of throwing", async () => {

@@ -9,6 +9,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listCommits, LOCAL_WORK_REFS } from "../src/git";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 async function git(args: string[], cwd: string): Promise<string> {
   const p = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -19,7 +20,7 @@ async function git(args: string[], cwd: string): Promise<string> {
 }
 
 async function repoWithCommit(): Promise<string> {
-  const dir = mkdtempSync(join(tmpdir(), "dba-refs-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-refs-")));
   await git(["init", "-q", "-b", "main"], dir);
   await git(["config", "user.name", "Test"], dir);
   await git(["config", "user.email", "test@example.com"], dir);
@@ -85,7 +86,7 @@ test("⚠ an UNBORN HEAD does not throw — `--ignore-missing` is load-bearing, 
   // That is the brand-new-repo-with-staged-work case the extractor exists to reach. Without the
   // flag this test throws instead of returning [].
   expect(LOCAL_WORK_REFS).toContain("--ignore-missing");
-  const dir = mkdtempSync(join(tmpdir(), "dba-unborn-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-unborn-")));
   await git(["init", "-q", "-b", "main"], dir);
   await git(["config", "user.name", "Test"], dir);
   await git(["config", "user.email", "test@example.com"], dir);
@@ -101,7 +102,7 @@ test("remote-only commits are still excluded — by construction now, not by an 
   await git(["add", "."], origin);
   await git(["commit", "-q", "-m", "work from another machine"], origin);
 
-  const clone = mkdtempSync(join(tmpdir(), "dba-clone-"));
+  const clone = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-clone-")));
   await git(["clone", "-q", "--no-checkout", origin, clone], tmpdir());
   await git(["config", "user.name", "Test"], clone);
   await git(["config", "user.email", "test@example.com"], clone);

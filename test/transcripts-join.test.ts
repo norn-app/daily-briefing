@@ -17,6 +17,7 @@ import { emptyCounters, type TranscriptWhySource } from "../src/transcripts/scan
 import { unitKey } from "../src/subprojects";
 import { selectTurn } from "../src/transcripts/select";
 import type { Activity, Config } from "../src/types";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const CFG: Config = { provider: { cli: "c", argv: [], promptVia: "stdin" } };
 const prose = (s: string, n = 60) => (s + " ").repeat(Math.ceil(n / (s.length + 1))).slice(0, Math.max(n, s.length));
@@ -98,7 +99,7 @@ test("T3.1: infra drops THAT PATH ONLY — a sibling real path still constitutes
 // resolveProjectRoots fallback the "I worked here but committed nothing" case is silently lost —
 // which is exactly what RESUME exists to surface.
 test("T3.1: a repo absent from rootsByRepo still buckets to its SUB-ROOT via the resolveProjectRoots fallback", async () => {
-  const repo = mkdtempSync(pjoin(tmpdir(), "dba-m3-"));
+  const repo = removeAtRunEnd(mkdtempSync(pjoin(tmpdir(), "dba-m3-")));
   for (const d of ["packages/api", "packages/web"]) mkdirSync(pjoin(repo, d), { recursive: true });
   const cfg: Config = { ...CFG, subprojects: [{ repo, roots: ["packages/*"] }] };
 
@@ -428,11 +429,31 @@ test("T3.8: the start→commit histogram buckets the margin evidence (pre-mortem
   expect(bucketStartToCommit(48)).toBe("24+");   // beyond the chosen 24 h margin — the case that matters
 });
 
-test("T3.1: localDayOf buckets by LOCAL day", () => {
-  const iso = "2026-07-30T10:00:00.000Z";
-  expect(localDayOf(iso)).toBe(localDayOf(new Date(iso).toISOString()));
-  expect(/^\d{4}-\d{2}-\d{2}$/.test(localDayOf(iso))).toBe(true);
-});
+/** `localDayOf` evaluated in a CHILD process whose zone is forced to `zone`. Not an in-process switch,
+ *  for the reason test/in10-stash-suggestions.test.ts measured: bun honours an assignment to
+ *  `process.env.TZ` but after a `delete` ignores every later one, so a test cannot put the
+ *  originally-UNSET zone (`bun test` runs in UTC) back for the rest of the run. */
+async function localDayIn(zone: string, iso: string): Promise<string> {
+  const code = `const { localDayOf } = await import(${JSON.stringify(pjoin(import.meta.dir, "../src/transcripts/segments.ts"))});
+console.log(localDayOf(${JSON.stringify(iso)}));`;
+  const p = Bun.spawn([process.execPath, "-e", code], { env: { ...process.env, TZ: zone }, stdout: "pipe", stderr: "pipe" });
+  const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+  await p.exited;
+  if (p.exitCode !== 0) throw new Error(`localDayOf child (${zone}) exited ${p.exitCode}: ${err}`);
+  return out.trim().split("\n").at(-1)!;
+}
+
+test("T3.1: localDayOf buckets by LOCAL day — pinned on instants whose UTC date differs from the local one", async () => {
+  // The previous form compared `localDayOf(iso)` with `localDayOf(new Date(iso).toISOString())` — the
+  // same instant through the same function, a tautology that a UTC-slicing implementation also
+  // satisfied (measured 2026-09-24). `bun test` runs in UTC, where local and UTC dates never differ,
+  // so the property has to be pinned under a FORCED zone on each side of Greenwich. Expectations are
+  // literals, not recomputed with the code's own getters.
+  expect(await localDayIn("Pacific/Auckland", "2026-07-30T22:00:00.000Z")).toBe("2026-07-31");     // 10:00 NZST, next local day
+  expect(await localDayIn("America/Los_Angeles", "2026-07-31T05:00:00.000Z")).toBe("2026-07-30"); // 22:00 PDT, previous local day
+  expect(await localDayIn("UTC", "2026-07-30T10:00:00.000Z")).toBe("2026-07-30");                  // and the zone `bun test` uses
+  expect(/^\d{4}-\d{2}-\d{2}$/.test(localDayOf("2026-07-30T10:00:00.000Z"))).toBe(true);
+}, 20_000);
 
 // ── T3.4a REGRESSION (2026-08-06): the resolution pass covered ONE curve ─────────────────────────
 //

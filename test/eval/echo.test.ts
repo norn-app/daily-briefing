@@ -151,15 +151,23 @@ test("adversarial echo: every bullet still renders, whatever the labels do", asy
   for (const b of [...s.recap, ...s.resume]) expect(out).toContain(b.text);
 });
 
-test("adversarial echo: a label matching NO unit renders bare — the why is dropped, not the bullet", async () => {
-  const s = await advStruct({ "no-such-unit": "this why must never appear" });
+test("adversarial echo: a label matching NO unit still renders its bullet, and a why handed to the render under that label prints exactly ONCE", async () => {
+  const s = await advStruct({ "no-such-unit": "a why keyed only by its bullet label" });
   const out = renderBriefing(s);
-  // The projection is what drops an orphan why in production; here the RENDER must also not invent
-  // a line for a label whose unit does not exist.
+  // The bullet is never lost to its label (invariant 1's converse).
   expect(out).toContain("did work under a label matching no unit");
-  // …and if it did render, it would be attached to a unit the run never produced.
-  const whyLines = out.split("\n").filter(isWhyLine);
-  expect(whyLines.length).toBeLessThanOrEqual(1);
+  // ⚠ MEASURED 2026-09-24, and it corrects the comment this test used to carry. The render keys whys
+  // on BULLET labels, not on units — it has no units — so a why under a label that has a bullet
+  // prints once, before that bullet, whatever the units were. "Matching no unit" is a PROJECTION
+  // concept: in production the `whys` projection never emits this key, which is where an orphan why
+  // is dropped (see the transcripts join/scan tests). The old `toBeLessThanOrEqual(1)` accepted both
+  // 0 and 1 and so pinned neither; the exact count is the render's contract.
+  const lines = out.split("\n");
+  const whyLines = lines.filter(isWhyLine);
+  expect(whyLines.length).toBe(1);
+  expect(parseWhy(whyLines[0]!)).toBe("a why keyed only by its bullet label");
+  // …emitted immediately before the FIRST bullet with that label, in its RECAP home.
+  expect(lines[lines.indexOf(whyLines[0]!) + 1]).toContain("[no-such-unit] did work under a label matching no unit");
 });
 
 test("adversarial echo: norm-colliding decorated labels resolve to ONE why line, never three", async () => {

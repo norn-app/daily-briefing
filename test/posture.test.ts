@@ -17,7 +17,7 @@
 // `hardenedProvider` that never passes through `runCore`, so unlike the main path — where `core.ts`
 // folds warnings into `struct.warnings` — their warnings are genuinely lost rather than merely unprinted.
 import { test, expect } from "bun:test";
-import { postureLine, posturePhrase, mergeWarnings, isPostureWarning, TRUNCATION_SENTINEL } from "../src/eval/posture";
+import { postureLine, posturePhrase, mergeWarnings, isPostureWarning, TRUNCATION_SENTINEL, API_TRUNCATION_SENTINEL, API_CLEARTEXT_SENTINEL, API_TRANSPORT_SENTINEL } from "../src/eval/posture";
 
 const HARD_OFF = "provider hardening is DISABLED by config (provider.harden: false) — surrendering tool gating (--tools=)";
 const PARTIAL = "provider hardening is PARTIAL: --tools is not listed in `claude --help`, so it was not injected — note --tools is what disables the CLI's built-in tools";
@@ -123,7 +123,18 @@ test("EVERY hardening warning harden.ts can emit is recognised — enforced agai
   /** Emitters that are deliberately NOT posture warnings. Every entry needs a reason, and adding one
    *  should feel like a decision — that is the whole difference between this and simply widening
    *  `isPostureWarning` until the guard stops complaining. */
-  const NON_POSTURE = [TRUNCATION_SENTINEL];
+  const NON_POSTURE = [
+    TRUNCATION_SENTINEL,
+    // A3. The MODEL hit its output ceiling. Same class as the entry above — it describes the RESULT
+    // being cut off, not the provider's authority — but a different cause with a different fix, so it
+    // is a separate constant rather than a widening of that one.
+    API_TRUNCATION_SENTINEL,
+    // A3. Plain http to a non-loopback endpoint. Describes the CONFIDENTIALITY OF THE WIRE, not the
+    // provider's authority, and it is a deliberate user configuration rather than a malfunction —
+    // classifying it as posture would render `degraded` for a considered choice, which is exactly the
+    // misreport the isOptOut carve-out exists to prevent.
+    API_CLEARTEXT_SENTINEL,
+  ];
   const emitted: string[] = [];
   const { Glob } = await import("bun");
   for await (const f of new Glob("**/*.ts").scan({ cwd: new URL("../src", import.meta.url).pathname, absolute: true })) {
@@ -132,7 +143,13 @@ test("EVERY hardening warning harden.ts can emit is recognised — enforced agai
   const hardenSrc = await Bun.file(new URL("../src/harden.ts", import.meta.url)).text();
   emitted.push(...[...hardenSrc.matchAll(RETURN_RE)].map((m) => m[1]!));
   // A floor, so a regex that silently stops matching fails loudly instead of vacuously passing.
-  expect(emitted.length).toBeGreaterThanOrEqual(15);
+  // ⚠ RE-MEASURED AND RAISED WITH A3, per the same policy test/isolation.meta.test.ts states for its
+  // own floors: a floor carried forward unchanged while the true count grows is a margin that rots —
+  // three emitters could stop matching with the guard still green. Measured at THIS commit by running
+  // the two regexes over src/: 18 (15 before this slice, plus the api hardening carve-out, the api
+  // truncation warning and the cleartext warning). Set AT the measured value, which is where the
+  // pre-A3 floor was set, so the margin is zero by design for this particular guard.
+  expect(emitted.length).toBeGreaterThanOrEqual(18);
   const missed = emitted.filter((w) => !isPostureWarning(w) && !NON_POSTURE.some((k) => w.includes(k)));
   expect(missed).toEqual([]);
 });
@@ -233,7 +250,16 @@ test("flattening a multi-line warning keeps a word boundary — it must not glue
   expect(line).toContain("line one line two tabbed");
 });
 
-test("every hardenedProvider in the scripts has its warnings read — the wiring is otherwise untestable", async () => {
+test("every buildProvider in the scripts has its warnings read — the wiring is otherwise untestable", async () => {
+  // ⚠ A3 RE-POINTED THIS GUARD, and re-pointing rather than deleting is the whole point. Slice 2 moved
+  // all four construction sites from `hardenedProvider(` to `buildProvider(`, which made this test's
+  // `expect(built.length).toBeGreaterThan(0)` fail LOUDLY — correct behaviour, and exactly what the
+  // design predicted. It was then re-pointed at the new name with BOTH properties preserved (every
+  // construction is a named binding; every binding reaches mergeWarnings), never loosened, because a
+  // vacuously-passing guard on the B10 invariant is worse than no guard at all.
+  //
+  // Seen red twice before being accepted, on a disposable copy of the tree: once by the rename itself,
+  // and once by re-introducing an INLINE `buildProvider(...)` argument in scripts/eval.ts.
   // No test imports or executes `scripts/*.ts`, so every script-side line of this feature is
   // mutation-invisible: deleting `caseProvider` from the merge was measured surviving the whole suite.
   // A static structural guard is the only thing that can catch that — same shape as the existing
@@ -262,13 +288,19 @@ test("every hardenedProvider in the scripts has its warnings read — the wiring
   };
   for (const f of ["../scripts/eval.ts", "../scripts/audit.ts"]) {
     const src = await Bun.file(new URL(f, import.meta.url)).text();
-    const built = [...src.matchAll(/const\s+(\w+)\s*=\s*hardenedProvider\(/g)].map((m) => m[1]!);
+    const built = [...src.matchAll(/const\s+(\w+)\s*=\s*buildProvider\(/g)].map((m) => m[1]!);
     expect(built.length).toBeGreaterThan(0);
+    // A3: `hardenedProvider(` must no longer appear in these scripts AT ALL. Without this clause a
+    // partial revert — one site going back to a direct `hardenedProvider(...)` while the others use the
+    // factory — would leave `built.length > 0` true and sail straight past the guard, which is the
+    // four-sites-drift failure B10 names and the factory exists to make impossible.
+    expect(`${f} direct-hardenedProvider`).toBe(
+      (src.match(/hardenedProvider\(/g) ?? []).length === 0 ? `${f} direct-hardenedProvider` : `${f} BYPASSES buildProvider WITH A DIRECT hardenedProvider(...) CALL`);
     // EVERY construction must be a named binding, not just every binding checked: the original code
-    // called `hardenedProvider(...)` INLINE as an argument, which creates no binding and would sail past
+    // called the constructor INLINE as an argument, which creates no binding and would sail past
     // a bindings-only scan while its warnings went unread — a partial revert to that shape must fail.
     expect(`${f} inline-constructions`).toBe(
-      (src.match(/hardenedProvider\(/g) ?? []).length === built.length ? `${f} inline-constructions` : `${f} HAS AN UNBOUND hardenedProvider(...) CALL`);
+      (src.match(/buildProvider\(/g) ?? []).length === built.length ? `${f} inline-constructions` : `${f} HAS AN UNBOUND buildProvider(...) CALL`);
     for (const v of built) {
       // Two legal routes, because audit.ts collects into an array and spreads it — so a direct-mention
       // check alone would fail a correctly-wired file, and a "mentions mergeWarnings somewhere" check
@@ -326,4 +358,54 @@ test("postureLine marks a truncated run — including one whose hardening was ot
   // to close, left open for exactly the users — non-claude CLIs — who never see any other signal.
   expect(postureLine([real, "provider hardening skipped: `codex` is not recognised as the claude CLI, so no isolation flags were injected"]))
     .toBe("posture: unhardened (non-claude CLI) · truncated");
+});
+
+// ── A3/T8: the fifth phrase ───────────────────────────────────────────────────────────────────────
+
+test("A3: the api carve-out ALONE yields `unhardened (api provider)`", () => {
+  // ⚠ Neither `full` nor `degraded`, and both wrong answers are the misreports this module exists to
+  // prevent: `full` asserts a hardening property that was never applied (the provenance hole C2 closed),
+  // and `degraded` reports a considered configuration as a broken machine (the reason isUnhardenable
+  // exists for codex users).
+  const API = "provider hardening does not apply to this run: the anthropic API provider spawns nothing, so there is no CLI process to harden — no flags were injected, no working directory was narrowed, and no child environment was withheld";
+  expect(API).toContain(API_TRANSPORT_SENTINEL);
+  expect(isPostureWarning(API)).toBe(true);        // it must be IN the vocabulary, or the carve-out is dead
+  expect(posturePhrase([API])).toBe("unhardened (api provider)");
+  expect(postureLine([API])).toBe("posture: unhardened (api provider)");
+});
+
+test("⚠ A3: the api carve-out must NOT mask a genuine malfunction", () => {
+  const API = "provider hardening does not apply: there is no CLI process to harden";
+  expect(posturePhrase([API, ANOMALY])).toBe("degraded");
+  expect(posturePhrase([API, "the provider's working directory could not be narrowed"])).toBe("degraded");
+});
+
+test("A3: api + `off (by config)` resolves by the existing dominance rule", () => {
+  const API = "provider hardening does not apply: there is no CLI process to harden";
+  const OPT = "provider hardening is DISABLED by config (provider.harden: false) — surrendering x";
+  // The EXPLICIT config choice dominates, exactly as it does over the non-claude carve-out.
+  expect(posturePhrase([API, OPT])).toBe("off (by config)");
+  expect(posturePhrase([OPT, API])).toBe("off (by config)");
+  // …and `api provider` beats `non-claude CLI`, which is the more specific true statement: there is no
+  // CLI at all, claude-shaped or otherwise.
+  const UNH = "provider hardening skipped: `codex` is not recognised as the claude CLI, so no isolation flags were injected";
+  expect(posturePhrase([API, UNH])).toBe("unhardened (api provider)");
+});
+
+test("A3: the api truncation sentinel rides the SAME ` · truncated` mark as the stream one", () => {
+  // To a reader of EVAL.md "this result was cut off" is ONE fact, even though the two causes differ —
+  // so the mark is shared while the sentinels stay separate.
+  const API = "provider hardening does not apply: there is no CLI process to harden";
+  const CUT = "anthropic-api: the model stopped at its output-token limit (max_tokens 32), so this result was cut off";
+  expect(CUT).toContain(API_TRUNCATION_SENTINEL);
+  expect(isPostureWarning(CUT)).toBe(false);       // NOT posture — it says nothing about authority
+  expect(postureLine([CUT])).toBe("posture: full · truncated");
+  expect(postureLine([API, CUT])).toBe("posture: unhardened (api provider) · truncated");
+});
+
+test("A3: the cleartext warning is invisible to the posture phrase", () => {
+  const CLEAR = "the whole briefing context will be sent in cleartext over plain http to gpu.lan:8000";
+  expect(CLEAR).toContain(API_CLEARTEXT_SENTINEL);
+  expect(isPostureWarning(CLEAR)).toBe(false);
+  expect(posturePhrase([CLEAR])).toBe("full");
 });

@@ -3,6 +3,9 @@ import type { Activity } from "./types";
 import { localMidnight } from "./time";
 import { eventIdFor } from "./eventId";
 import { drain, raceFlush, sinkText } from "./stream";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // A hung network-mount repo (SMB/NFS/VPN, a disconnected share) must not block the unattended 7:20
 // run forever — bound every git call. On timeout Bun SIGKILLs git → its pipes EOF → the nonzero-exit
@@ -60,20 +63,50 @@ export class IncompleteReadError extends Error {
   }
 }
 
+/** Thrown by `runGit` when git was KILLED BY ITS TIMEOUT — Bun's SIGKILL after `timeoutMs` (tier B,
+ *  spec D2 revised): the classifier is EXACTLY `exitCode === null && signalCode === "SIGKILL"`, the
+ *  signal `runGit` sets as `killSignal`, and nothing else — no elapsed-time clause, because a child
+ *  that kills itself at once (the tests' `sh -c 'kill -KILL $$'`) is indistinguishable from a
+ *  timeout kill and must classify the same way. A git that dies by any OTHER signal (SIGTERM,
+ *  SIGSEGV) and every real non-zero exit stay the plain `Error`. Same message as that `Error`, and
+ *  still an `Error`, so every `.catch` and `orElse` in this file behaves exactly as before. B's
+ *  phase counts it as `timedOut` (a merge) or "not read" (a listing); anything else is `exception`. */
+export class GitTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitTimeoutError";
+  }
+}
+
 // How long to wait for the pipes to EOF AFTER git has already exited. This bounds EOF, not data:
 // the reads run concurrently while git is alive, so a slow-but-finite `git log` is bounded by
 // GIT_TIMEOUT_MS, never by this. Deliberately NOT provider.ts's 10s — that is paid once per
 // provider attempt, whereas runGit runs 10-12x per repo per tick (~110 calls at 10 repos), and on
 // a machine that actually has the pathology every one of them burns the full window.
-const GIT_FLUSH_MS = 500;
+export const GIT_FLUSH_MS = 500;   // exported for its bounds test only (git.incomplete-read.test.ts)
+let gitFlushOverride: number | undefined;   // test-only; production never sets it, so runGit reads GIT_FLUSH_MS itself
+
+/** ⚠ TEST-ONLY seam. Production never calls this, so `runGit` always races against `GIT_FLUSH_MS`.
+ *  A fully-faked held-pipe test (every `Bun.spawn` faked, a stdout that never EOFs) otherwise waits
+ *  the full window on every runGit call it provokes — ~5 s of pure wait across the held-pipe
+ *  suites (10 calls × 500 ms) — and `runGit` is reached through gitActivity / gitDirExists /
+ *  resolveAuthor, so threading a `flushMs` option through those signatures for a test-only knob is
+ *  the wrong shape; a module-level setter is. Callers restore with `undefined` in a `finally`
+ *  (test/fixtures/git-flush.ts). It holds only an OVERRIDE, never a copy of the default: with a
+ *  second copy, the value production actually raced was one no test observed (review, 2026-09-24). */
+export function setGitFlushMsForTests(ms: number | undefined): void {
+  gitFlushOverride = ms;
+}
 
 /** Swallow a git failure to `fallback` — EXCEPT an IncompleteReadError, which must propagate.
  *  These `.catch`es exist because an unborn HEAD / missing git config / detached HEAD are all
  *  normal; an incomplete read is not, and swallowing it silently degrades (at resolveAuthor, to NO
- *  AUTHOR FILTER, crediting coworkers' commits). Uniform within git.ts, no per-site exceptions: on
+ *  AUTHOR FILTER, crediting coworkers' commits). Uniform within git.ts's BRIEFING reads: on
  *  a machine with a held pipe every subsequent call is untrustworthy too, so failing early beats
  *  guessing. Two sites OUTSIDE this file stay deliberately swallowed (core.ts's render-time drift
- *  re-check and scripts/audit.ts's ground truth) — both advisory, both scoped out by C1 rev 3.4. */
+ *  re-check and scripts/audit.ts's ground truth) — both advisory, both scoped out by C1 rev 3.4.
+ *  ONE site inside it swallows everything, by contract: `isPartialClone`, which only `doctor` calls and
+ *  only for a NOTE (round-3 harden A3-L1 — its `orElse` let an incomplete read throw out of doctor). */
 function orElse<T>(fallback: T) {
   return (e: unknown): T => { if (e instanceof IncompleteReadError) throw e; return fallback; };
 }
@@ -96,9 +129,14 @@ export async function runGit(args: string[], cwd: string, timeoutMs = GIT_TIMEOU
   // differed structurally (it hoisted the `Promise.all` above `await exited` and nested two
   // try/finallys). Policy stays HERE — see the fail-closed gate below, which is what makes this
   // caller different from the provider's.
-  await raceFlush(o, e, GIT_FLUSH_MS);
+  await raceFlush(o, e, gitFlushOverride ?? GIT_FLUSH_MS);
   const out = sinkText(o.sink), err = sinkText(e.sink);
-  if (p.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed in ${cwd}: ${err}`);
+  if (p.exitCode !== 0) {
+    const message = `git ${args.join(" ")} failed in ${cwd}: ${err}`;
+    // Killed by the timeout: Bun reports `exitCode: null` with the kill signal it sent (D2 revised).
+    if (p.exitCode === null && p.signalCode === "SIGKILL") throw new GitTimeoutError(message);
+    throw new Error(message);
+  }
   // FAIL CLOSED on an incomplete stdout. "" is a legitimate success here (`git log` with no
   // in-window commits; `git status --porcelain` on a clean tree), so returning a partial/empty
   // payload would fabricate a quiet day and stamp it — worse than the hang this replaces. Gate on
@@ -114,10 +152,64 @@ export async function gitDirExists(repo: string): Promise<boolean> {
   return runGit(["rev-parse", "--git-dir"], repo).then(() => true).catch(orElse(false));
 }
 
+/** Is `repo` a PARTIAL clone — one git may lazily download missing objects into, from its own remote,
+ *  while the tool's `git log --numstat` / `log -p` reads run? Set by `git clone --filter` (and
+ *  `scalar clone`): `extensions.partialClone` names the promisor remote, `remote.<name>.promisor` is
+ *  true, and/or `remote.<name>.partialclonefilter` is set. READ-ONLY and offline — `git config`, never
+ *  a fetch — and fail-open to `false` (an unreadable repo, a timeout, no git): `doctor` uses it for a
+ *  NOTE, never for a verdict. `--get-regexp` prints canonical (lower-cased) section and key names.
+ *  ⚠ THREE READS, in parallel and each bounded by `timeoutMs`, because the keys differ in type and in
+ *  WHERE git reads them from:
+ *   - `extensions.partialClone` is a STRING (the promisor remote's name), and git honours it ONLY from
+ *     the repository's OWN config file — it is a repository-format extension. Measured on git 2.50.1
+ *     by whether git lazily fetches a missing object (round-4 harden A4-L1 / B4-L1): the key in the
+ *     global file, in an `include.path` file, or in `-c` / `GIT_CONFIG_COUNT` never fetches, and the
+ *     repo's own `origin` under a LATER included empty value still fetches. So this read is `--local`,
+ *     which reads that one file and does not follow includes.
+ *   - `remote.<name>.promisor` is a BOOLEAN, read through git's OWN parser (`--type=bool`, git >= 2.18)
+ *     so it is true exactly when git says so — `promisor=2` and a bare `promisor` (no `=`) included,
+ *     which a list of spellings (`true/yes/on/1`) missed for the former (round-2 harden). A value git
+ *     cannot read as a boolean (`promisor=maybe`) fails that read with exit 128 — as `git status` and
+ *     `git commit` fail on it too, measured on git 2.50.1 — and so fails open, for every remote in that
+ *     repo; the other two reads are separate so it never takes them down with it.
+ *   - `remote.<name>.partialclonefilter` is a STRING (`blob:none`, …) — so NOT `--type=bool`, which would
+ *     fail on every real value. Its presence alone makes the remote a promisor: measured on git 2.50.1,
+ *     a filter alone fetches, and so does a filter beside `promisor = false` (round-4 harden A4-L1).
+ *  The two `remote.*` keys are ordinary config, which git reads at every level (system, global, local,
+ *  includes) — measured: a global `promisor = true`, or a global filter alone, also fetches — so those
+ *  two reads are NOT `--local`.
+ *  ⚠ FAIL OPEN MEANS EVERY FAILURE — an IncompleteReadError included (round-3 harden A3-L1). The other
+ *  reads in this file let that one through (`orElse`); here it rejected out of doctor's whole report.
+ *  ⚠ `--get-regexp` LISTS EVERY VALUE, overridden ones too, in config order, and the keys do NOT resolve
+ *  alike — measured on git 2.50.1 by what git does on a missing object (a lazy fetch, or not), round-3
+ *  harden G3-3:
+ *   - `extensions.partialClone` is single-valued: the LAST value is the one git uses. `origin`, then an
+ *     empty value later in the same file → git cannot fetch (it refuses its own `--filter` before
+ *     connecting), so only the last value counts here.
+ *   - `remote.<name>.promisor` is NOT last-wins: git marks a remote a promisor on ANY true value and a
+ *     later `false` never unmarks it (a global `true` under a local `false`, or `true` then `false` in one
+ *     file → git still fetches). So ANY true counts, deliberately — "last value" would hide a real one.
+ *   - `remote.<name>.partialclonefilter`: ANY entry counts, an empty value included (measured: fetches). */
+export async function isPartialClone(repo: string, timeoutMs = 2_000): Promise<boolean> {
+  const [ext, promisor, filter] = await Promise.all([
+    runGit(["config", "--local", "--get-regexp", "^extensions\\.partialclone$"], repo, timeoutMs).catch(() => ""),
+    runGit(["config", "--type=bool", "--get-regexp", "^remote\\..+\\.promisor$"], repo, timeoutMs).catch(() => ""),
+    runGit(["config", "--get-regexp", "^remote\\..+\\.partialclonefilter$"], repo, timeoutMs).catch(() => ""),
+  ]);
+  const entries = (out: string) => out.split("\n").filter(Boolean).map((line) => {
+    const sp = line.indexOf(" ");
+    return sp === -1 ? { key: line, value: "" } : { key: line.slice(0, sp), value: line.slice(sp + 1).trim() };
+  });
+  const lastExt = entries(ext).filter((e) => e.key.toLowerCase() === "extensions.partialclone").at(-1);
+  return (lastExt !== undefined && lastExt.value !== "")
+    || entries(promisor).some((e) => /^remote\..+\.promisor$/i.test(e.key) && e.value === "true")
+    || entries(filter).some((e) => /^remote\..+\.partialclonefilter$/i.test(e.key));
+}
+
 /** SHA + committer-date ISO of a ref, in ONE `git show` (both come from the same commit object).
  *  Best-effort: returns empty strings if the ref can't be resolved (e.g. unborn HEAD). */
 async function shaAndDate(repo: string, ref: string): Promise<{ sha: string; date: string }> {
-  const out = (await runGit(["show", "-s", "--format=%H%n%cI", ref], repo).catch(orElse(""))).trim();
+  const out = (await runGit(["show", NO_SHOW_SIGNATURE, "-s", "--format=%H%n%cI", ref], repo).catch(orElse(""))).trim();
   const [sha, date] = out.split("\n");
   return { sha: (sha ?? "").trim(), date: (date ?? "").trim() };
 }
@@ -167,6 +259,20 @@ async function shaAndDate(repo: string, ref: string): Promise<{ sha: string; dat
 //    last-working-day window. A stash is resumption state and has its OWN signal — `git stash list`
 //    in `resumptionSignals` below — which is why dropping it here loses nothing.
 export const LOCAL_WORK_REFS = ["--branches", "--tags", "--ignore-missing", "HEAD"] as const;
+
+/** ⚠ ON EVERY `git log` / `git show` / `git stash list` WHOSE OUTPUT IS PARSED. A user's
+ *  `log.showSignature=true` makes git run gpg on every SIGNED commit and print gpg's verdict INTO STDOUT,
+ *  ahead of the formatted record ("gpg: Signature made …") — so `shaAndDate` read a gpg line as the SHA,
+ *  and the field-split parsers below saw lines they never wrote (measured on git 2.50.1 with a stand-in
+ *  `gpg.program`; `test/git.show-signature.test.ts` pins it). `--no-show-signature` overrides the config
+ *  for that one command; it exists since git 2.10, the release that introduced `log.showSignature`.
+ *  `stash list` forwards its options to `git log`, so it takes the flag too.
+ *  ⚠ THE FLAG IS HALF OF IT; AN EXPLICIT FORMAT IS THE OTHER HALF (round-3 harden G3-1). A user's
+ *  `format.pretty` holding `%G?`/`%GG` makes git verify the signature to fill the placeholder — gpg
+ *  runs, `--no-show-signature` notwithstanding (measured, git 2.50.1: once per signed commit). Every
+ *  such read therefore also names its own `--format`/`--pretty`, which replaces `format.pretty`;
+ *  `rev-list` never reads that config (measured too). `test/git.show-signature.test.ts` pins both. */
+export const NO_SHOW_SIGNATURE = "--no-show-signature";
 
 // Author-filter args, shared with the audit's ground-truth query (same drift rationale).
 export function authorArgs(author?: { names?: string[]; emails?: string[] }): string[] {
@@ -346,7 +452,7 @@ export async function committerDaysWithCommits(
   // Include the subject so bot/auto commits can be excluded HERE too — otherwise a repo that
   // auto-commits every day (the vault) marks every day active and collapses the shared window to
   // just yesterday, hiding real older work that listCommits would then filter out anyway (#3/#1).
-  const out = await runGit(["log", ...LOCAL_WORK_REFS, ...(await windowArgs(cutoff)), "--pretty=%cI%x1f%s", ...authorArgs(author)], repo);
+  const out = await runGit(["log", NO_SHOW_SIGNATURE, ...LOCAL_WORK_REFS, ...(await windowArgs(cutoff)), "--pretty=%cI%x1f%s", ...authorArgs(author)], repo);
   const days = new Set<number>();
   for (const line of out.split("\n").filter(Boolean)) {
     const [cISO, subject] = line.split("\x1f");
@@ -369,7 +475,7 @@ export async function listCommits(
   // %P (parent hashes) drives merge detection: a merge has 2+ parents.
   const fmt = "%x1e%cI%x1f%H%x1f%P%x1f%s";
   const out = await runGit(
-    ["-c", "core.quotePath=false", "log", ...LOCAL_WORK_REFS, ...(await windowArgs(start.getTime())), "--date-order", "--numstat", `--pretty=format:${fmt}`, ...authorArgs(author)],
+    ["-c", "core.quotePath=false", "log", NO_SHOW_SIGNATURE, ...LOCAL_WORK_REFS, ...(await windowArgs(start.getTime())), "--date-order", "--numstat", `--pretty=format:${fmt}`, ...authorArgs(author)],
     repo,
   );
   const acts: Activity[] = [];
@@ -442,7 +548,7 @@ export async function listPrMerges(
   // -c core.quotePath=false, same as listCommits (review MED-1, measured): without it non-ASCII
   // paths come octal-escaped, unquotePath passes the escapes through, rootOf then matches no root —
   // dropping exactly the votes mergeLabel exists to count.
-  const baseArgs = ["-c", "core.quotePath=false", "log", ...LOCAL_WORK_REFS, ...(await windowArgs(start.getTime())), "--merges", "--date-order", `--pretty=format:${fmt}`, ...authorArgs(author)];
+  const baseArgs = ["-c", "core.quotePath=false", "log", NO_SHOW_SIGNATURE, ...LOCAL_WORK_REFS, ...(await windowArgs(start.getTime())), "--merges", "--date-order", `--pretty=format:${fmt}`, ...authorArgs(author)];
   let out: string;
   let hasFiles = true;
   try {
@@ -471,36 +577,146 @@ export async function listPrMerges(
   return merges;
 }
 
-/** `git patch-id --stable` for each SHA — the content fingerprint git itself uses for cherry
+/** `git patch-id --stable` for a BATCH of SHAs — the content fingerprint git itself uses for cherry
  *  detection: two commits with equal stable patch-ids carry the identical change (rebase copies
  *  match even when hunk offsets shifted). Defect E (EVAL day 33): a rebase-merge plus a stale local
  *  branch put the SAME five changes into "Today so far" twice under different SHAs.
  *
- *  BEST-EFFORT by design: any failure (git missing patch-id, timeout, nonzero exit, merge commit
- *  with no patch) simply omits that SHA from the map, and the caller keeps both copies — fail open,
- *  never fail the briefing. Bounded: callers pre-filter to same-day commits with colliding subjects,
- *  so N is ~0 on a normal morning. Uses Bun.spawn directly (a two-process pipe) rather than runGit,
- *  which is single-command by contract. */
+ *  TWO SPAWNS PER CALL, not two per SHA (IN-1 round 1): one
+ *  `git log --no-walk=unsorted --stdin -p` feeding one `git patch-id --stable`, which prints
+ *  `<patch-id> <commit-sha>` per patch — so the SHA association comes back for free and no second
+ *  pass is needed to recover it. Measured on the IN-1 fixtures: 433 commits in one group
+ *  10,784ms → 82ms (the round-0 per-SHA form vs the SHIPPED spool form below; the round-1 pipe that
+ *  measured 75ms here is gone), patch-id map identical per SHA to the per-SHA form.
+ *
+ *  ⚠ THE TWO SPAWNS ARE NOT PIPED TO EACH OTHER — the patch stream is SPOOLED THROUGH A PRIVATE
+ *  TEMP FILE, and that is a memory correctness fix, not a style choice (IN-1 round 2). Round 1 wrote
+ *  `stdin: log.stdout` and this docstring claimed it was "an OS-level pipe … memory stays flat in the
+ *  batch size". BOTH HALVES WERE FALSE, measured: `stdin: <subprocess>.stdout` is NOT an fd handoff
+ *  in Bun — the parent READS the producer's pipe and writes it to the consumer, and it does NOT
+ *  propagate backpressure, so whenever the consumer drains slower than the producer emits (which is
+ *  exactly `git patch-id --stable` against `git log -p`) the unread difference accumulates in the
+ *  PARENT's address space, unbounded. Measured with no git involved at all (a 4 MB-then-stall
+ *  consumer): parent peak RSS 154 MB at a 50 MB stream and 400 MB at 150 MB, against a flat 32 MB
+ *  for the same producer/consumer joined by a real shell pipe. On this function's own fixture
+ *  (60 commits, 86.2 MB of patch text; peak RSS via `/usr/bin/time -l`, median of 3) the shipped
+ *  round-1 form peaked at **57.3 / 161.4 / 271.7 MB at 5.7 / 43.1 / 86.2 MB of patch stream** —
+ *  ~2.7 MB of RSS per MB of stream; the round-0 per-SHA form it replaced peaked at 72 MB. So
+ *  batching had INVERTED the property this comment asserted: round 0 peaked at O(largest patch),
+ *  round 1 at O(whole collision group), with no cap on group size.
+ *
+ *  Spooling to a file restores it FOR REAL: the kernel owns every byte, this process reads only
+ *  patch-id's own output (~50 bytes per commit). Same fixture, same method, peak RSS
+ *  **40.7 / 40.9 / 41.0 MB** at those same three stream sizes — flat across a 15x stream increase
+ *  (+0.3 MB), against a 37.7 MB floor for a bun process that does no patch-id work at all. The
+ *  trade is wall-clock on the pathological row only: 272ms → 521ms at 86 MB, because the two stages
+ *  serialise and the bytes round-trip through the filesystem; on the real cost table below the
+ *  streams are kilobytes and the spool costs a file create + unlink. Pinned by
+ *  `test/day33-batch.test.ts` ("patchIds does not pipe the patch stream through this process").
+ *  Costs transient DISK equal to the stream instead of RAM, which is the trade we want for a
+ *  background 7:20 run. Rejected alternatives, both measured: one `sh -c 'git log … | git patch-id'`
+ *  is genuinely flat (36 MB) but this repo targets Windows (`provider.ts`, `harden.ts`'s win32
+ *  branch) and its CI runs the suite on ubuntu, where `/bin/sh` is dash and `set -o pipefail` — the
+ *  only way a shell reports a FAILING git-log through a pipeline — does not exist; chunking the SHA
+ *  list only plateaus (88 MB at chunk 4, 246 MB at chunk 64) because the allocator does not return
+ *  the high-water mark between chunks. A serialised spool also cannot deadlock by construction:
+ *  there is no pipe between the two processes to fill.
+ *
+ *  BEST-EFFORT by design: any failure (git missing patch-id, timeout, nonzero exit, an unknown SHA,
+ *  or a merge commit — `log -p` emits no patch for one) simply omits those SHAs from the map, and
+ *  the caller keeps every copy — fail open, never fail the briefing. Batching widens ONE failure's
+ *  blast radius from a single SHA to the group; that is the SAFE direction, because the caller drops
+ *  nothing it could not fingerprint. Bounded: callers pre-filter to commits whose SUBJECT collides
+ *  within their repo — since IN-1 for the WINDOW list as well as the same-day one, so the number of
+ *  CALLS grew while the per-call cost became O(1) spawns in N. Uses Bun.spawn directly rather than
+ *  runGit, which is single-command by contract; both spawns carry runGit's GIT_TIMEOUT_MS + SIGKILL,
+ *  so a wedged git cannot hold the briefing open.
+ *
+ *  TWO MEASURED RESIDUALS of the spool, neither a defect, both recorded so the next reader does not
+ *  have to re-derive them. (1) The cleanup is an in-process `finally`, so killing the PARENT mid-spool
+ *  leaks the directory — reproduced under SIGKILL and under SIGTERM, which is what launchd sends
+ *  (SIGINT leaves nothing; Bun unwinds). The orphaned `git log` child even keeps writing after the
+ *  parent dies, so the residue is the group's FULL stream, not a partial one. It is nonetheless
+ *  negligible HERE: a real day-34-shaped group (10 commits, 5 patch-identical pairs) spools 481
+ *  BYTES, and macOS reaps `/var/folders/…` via `com.apple.bsd.dirhelper` daily at 03:35 with
+ *  CLEAN_FILES_OLDER_THAN_DAYS=3; CI is an ephemeral ubuntu runner whose /tmp dies with the job. A
+ *  year of daily runs, assuming a kill landed in the millisecond-wide window EVERY day, is under
+ *  ~1.5 KB. No startup sweep is therefore warranted. (2) UNVERIFIED (no Linux host): where TMPDIR is
+ *  a tmpfs — Ubuntu 24.04+ and several distros default /tmp that way — the bytes go back into RAM as
+ *  page cache rather than onto disk. That relocates the cost rather than removing it, and because
+ *  page cache is not process RSS, the test pin above would still PASS while the memory is still
+ *  consumed. Not a concern for the stated production target (macOS, disk-backed APFS TMPDIR). */
 export async function patchIds(repo: string, shas: string[]): Promise<Map<string, string>> {
   const out = new Map<string, string>();
-  for (const sha of shas) {
-    try {
-      const show = Bun.spawn(["git", "-C", repo, "show", "--format=", "--no-color", "--unified=3", sha],
-        { stdout: "pipe", stderr: "ignore" });
-      const patch = await new Response(show.stdout).arrayBuffer();
-      if ((await show.exited) !== 0 || patch.byteLength === 0) continue;
-      const pid = Bun.spawn(["git", "patch-id", "--stable"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
-      pid.stdin.write(patch);
-      await pid.stdin.end();
-      const line = await new Response(pid.stdout).text();
-      if ((await pid.exited) !== 0) continue;
-      const id = line.trim().split(/\s+/)[0];
-      if (id) out.set(sha, id);
-    } catch {
-      // fail open: an unmapped SHA is simply never deduped
+  if (shas.length === 0) return out;
+  // `mkdtemp`, not a predictable name in a shared tmp: it creates the directory 0700 and fails rather
+  // than follow an existing symlink, so the spool cannot be pre-created or read by another user.
+  // `os.tmpdir()` for the same reason harden.ts uses it — it honours TEMP/TMP on Windows and the
+  // per-user 0700 `/var/folders/…` on macOS, instead of a hand-rolled "/tmp".
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(join(tmpdir(), "dba-patchids-"));
+    const spool = join(dir, "patches.diff");
+    // `--format=commit %H`: an explicit format, so a user's `format.pretty` (`%G?` runs gpg) is never
+    // read, and a FULL SHA on the `commit` line patch-id keys on — the default `medium` header is cut
+    // to 7 hex by `log.abbrevCommit=true`, which patch-id cannot read (measured: every id came back
+    // against the zero SHA, so nothing was ever deduped). patch-id skips everything up to `diff `.
+    const log = Bun.spawn(["git", "-C", repo, "log", NO_SHOW_SIGNATURE, "--format=commit %H", "--no-walk=unsorted", "--stdin", "-p", "--no-color", "--unified=3"],
+      { stdin: "pipe", stdout: Bun.file(spool), stderr: "ignore", timeout: GIT_TIMEOUT_MS, killSignal: "SIGKILL" });
+    log.stdin.write(shas.join("\n") + "\n");
+    await log.stdin.end();
+    // Checked SEPARATELY and FIRST, which the round-1 pipe could not do and a shell pipeline cannot
+    // do without `pipefail`: a git-log failure truncates the LAST patch mid-hunk, and a fingerprint
+    // of half a patch is not a fingerprint. Bail before patch-id ever sees the partial spool.
+    if ((await log.exited) !== 0) return out;
+    const pid = Bun.spawn(["git", "patch-id", "--stable"],
+      { stdin: Bun.file(spool), stdout: "pipe", stderr: "ignore", timeout: GIT_TIMEOUT_MS, killSignal: "SIGKILL" });
+    const text = await new Response(pid.stdout).text();   // patch-id's own output: one short line per commit
+    if ((await pid.exited) !== 0) return out;             // unmapped group → nothing dropped
+    const want = new Set(shas);
+    for (const line of text.split("\n")) {
+      const [id, sha] = line.trim().split(/\s+/);
+      if (id && sha && want.has(sha)) out.set(sha, id);
     }
+  } catch {
+    // fail open: an unmapped SHA is simply never deduped
+  } finally {
+    // The spool is transient and can be large; never leave it behind, on any exit path. Best-effort:
+    // a failure to clean up must not turn a cosmetic dedupe into a failed briefing.
+    if (dir) try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
   return out;
+}
+
+/** Are two commits ancestor-related, in EITHER direction? IN-1 round 1: `git patch-id` answers "same
+ *  change", NOT "same commit" — a do / revert / re-land trio puts byte-identical content back, so the
+ *  re-land and the ORIGINAL share both a subject and a patch-id. Dedupe on the fingerprint alone
+ *  therefore deletes a commit that really happened. Ancestry is the discriminator: a
+ *  rebase/cherry-pick/squash twin's copies sit on divergent histories and are NEVER ancestor-related,
+ *  while a revert-and-reland pair always is (the re-land descends from the original).
+ *
+ *  BOTH directions are tried because "older by committer date" is not "older by history":
+ *  `--committer-date-is-author-date` and `git am -C` both hand a descendant an earlier date than its
+ *  ancestor's.
+ *
+ *  THREE-STATE on purpose. `undefined` = the question could not be answered (git error, timeout,
+ *  unknown object), which callers must treat exactly like `true`: never drop on an unknown.
+ *  `merge-base --is-ancestor` exits 0 for ancestor, 1 for not, anything else for an error — so a
+ *  nonzero-that-is-not-1 is NOT a "no". At most two spawns, and only for a pair that already collided
+ *  on subject AND on patch-id, so the call count stays ~0 on real history. */
+export async function ancestryRelated(repo: string, a: string, b: string): Promise<boolean | undefined> {
+  try {
+    for (const [x, y] of [[a, b], [b, a]] as const) {
+      const p = Bun.spawn(["git", "-C", repo, "merge-base", "--is-ancestor", x, y],
+        { stdout: "ignore", stderr: "ignore", timeout: GIT_TIMEOUT_MS, killSignal: "SIGKILL" });
+      const code = await p.exited;
+      if (code === 0) return true;       // x is an ancestor of y → the pair is history, not a twin
+      if (code !== 1) return undefined;  // not a "no" — an error; the caller keeps both
+    }
+    return false;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Window-independent "what was I in the middle of" signals: uncommitted changes,
@@ -635,7 +851,7 @@ export async function resumptionSignals(repo: string): Promise<Activity[]> {
   // ONE `git stash list --format` yields sha + date + ref + subject per stash — no N+1 `git show`
   // per stash. `%gd: %gs` reconstructs the default `git stash list` line exactly (verified), and %H/%cI
   // are the same commit fields shaAndDate returned, so event_id (ref + sha) is unchanged.
-  const stashes = (await runGit(["stash", "list", "--format=%H%x1f%cI%x1f%gd%x1f%gs"], repo)).trim();
+  const stashes = (await runGit(["stash", "list", NO_SHOW_SIGNATURE, "--format=%H%x1f%cI%x1f%gd%x1f%gs"], repo)).trim();
   if (stashes) {
     for (const line of stashes.split("\n").filter(Boolean)) {
       const [sha, date, ref, subject] = line.split("\x1f");
@@ -648,4 +864,146 @@ export async function resumptionSignals(repo: string): Promise<Activity[]> {
     }
   }
   return out;
+}
+
+// ── Tier B (Stage-2 recap campaigns): the git budget, default-ref merges, merge members ─────────────
+// Spec §4.3 "How PR facts are derived" items 1–6; D2, D6, D9, D15. `listPrMerges` above (the foot's
+// render channel) and `LOCAL_WORK_REFS` are untouched: this is a second, separate reader.
+
+/** ONE budget for every git call B makes on a morning, shared by the listings and the `rev-list`s. It
+ *  runs from B's FIRST git call — the clock starts lazily, at the first `remainingMs()` read — so
+ *  constructing it early costs nothing. */
+export type GitBudget = {
+  /** Milliseconds left, never below 0. */
+  remainingMs(): number;
+  /** The per-call timeout for a call started now, or `undefined` when the call must NOT start. */
+  callTimeoutMs(): number | undefined;
+};
+
+/** The per-call timeout: `min(GIT_TIMEOUT_MS, floor(remaining) − 1000)`, and the call STARTS ONLY IF
+ *  that is ≥ 1 — otherwise `undefined`, "not started". The shape is dictated by how Bun reads
+ *  `timeout` (measured, bun 1.3.14): `0` means NO timeout, a non-integer throws `TypeError`, a negative
+ *  throws `RangeError`. So "no start under 1 000 ms" alone would pass `0` at exactly 1 000 ms remaining
+ *  — an unbounded call — and a fractional remaining (a real clock) would throw. Floor first, then the
+ *  ≥ 1 gate. Pure, so the arithmetic is pinned by test. */
+export function perCallTimeoutMs(remaining: number): number | undefined {
+  const t = Math.min(GIT_TIMEOUT_MS, Math.floor(remaining) - 1000);
+  return t >= 1 ? t : undefined;
+}
+
+export function startGitBudget(ms: number, now: () => number = () => performance.now()): GitBudget {
+  let startedAt: number | undefined;
+  const remainingMs = (): number => {
+    if (startedAt === undefined) startedAt = now();
+    return Math.max(0, ms - (now() - startedAt));
+  };
+  return { remainingMs, callTimeoutMs: () => perCallTimeoutMs(remainingMs()) };
+}
+
+/** A first-parent merge on the repo's default ref(s), in the window. `pr` is present only for the
+ *  GitHub form `Merge pull request #N from <remote>`, with `branch` = the remainder after the first
+ *  `/` of `<remote>`, or the whole name when it has none (`listPrMerges`' parse); a merge with any
+ *  other subject is NOT a PR (its members count toward K — D6 drops it before the innermost rule). */
+export type DefaultRefMerge = {
+  sha: string;
+  parents: string[];       // `%P`, in order: `parents[0]..parents[1]` is the `rev-list` range
+  timestamp: string;       // committer date, ISO
+  subject: string;
+  pr?: { number: number; branch: string };
+};
+
+const DEFAULT_REF_NAMES = ["main", "master"] as const;
+
+/** Spec §4.3 items 1–2 and 5, under the budget (items 4's rule for listings). Three git calls, each
+ *  started only when the budget allows: `symbolic-ref -q --short refs/remotes/origin/HEAD` (whose
+ *  catch re-throws a timeout kill and otherwise keeps D15's swallow — a missing `origin/HEAD` is not a
+ *  throw), ONE `for-each-ref` over `{basename of origin/HEAD} ∪ {main, master}` under `refs/heads/` and
+ *  `refs/remotes/origin/` (the engine's UNION — never a precedence chain, which walks only stale refs in
+ *  a repo cloned before a master→main rename), and ONE `git log --first-parent --merges` over every
+ *  ref that exists, skipped when none does. Merges are deduplicated by SHA and kept iff
+ *  `windowStart ≤ committer date < now` (the JS filter is authoritative; `--since-as-filter` only
+ *  pre-filters).
+ *  "NOT READ": if any of the three calls cannot start for lack of budget, or is killed by its timeout
+ *  (`GitTimeoutError`), this repo is not read — `{ merges: [], unread: true }`, and NO throw; its items'
+ *  commits then count toward K / `no PR fact`. A listing that fails any other way (a real non-zero exit,
+ *  an `IncompleteReadError`) still throws, which is `exception` at the phase. The COUNT of unread repos
+ *  (`prFacts.reposUnread`) is computed by `readPrFacts`, not here. */
+export async function listDefaultRefMerges(
+  repo: string, windowStart: Date, now: Date, budget: GitBudget,
+): Promise<{ merges: DefaultRefMerge[]; unread: boolean }> {
+  const unread = { merges: [] as DefaultRefMerge[], unread: true };
+  try {
+    // 1. origin/HEAD, if it resolves — under the budget
+    const t1 = budget.callTimeoutMs();
+    if (t1 === undefined) return unread;
+    const originHead = (await runGit(["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo, t1)
+      .catch((e) => { if (e instanceof GitTimeoutError) throw e; return orElse("")(e); })).trim();
+    const names = new Set<string>(DEFAULT_REF_NAMES);
+    const head = originHead.replace(/^origin\//, "");
+    if (head) names.add(head);
+    // 2. which of those refs exist, local and remote — ONE for-each-ref
+    const wanted = [...names].flatMap((n) => [`refs/heads/${n}`, `refs/remotes/origin/${n}`]);
+    const t2 = budget.callTimeoutMs();
+    if (t2 === undefined) return unread;
+    const existing = (await runGit(["for-each-ref", "--format=%(refname)", ...wanted], repo, t2))
+      .split("\n").map((l) => l.trim()).filter((l) => wanted.includes(l));
+    if (existing.length === 0) return { merges: [], unread: false };
+    // 3. ONE first-parent merge walk over every ref that exists
+    const t3 = budget.callTimeoutMs();
+    if (t3 === undefined) return unread;
+    const out = await runGit(
+      ["log", NO_SHOW_SIGNATURE, "--first-parent", "--merges", ...(await windowArgs(windowStart.getTime())), "--format=%H%x1f%P%x1f%cI%x1f%s", ...existing],
+      repo, t3,
+    );
+    const seen = new Set<string>();
+    const merges: DefaultRefMerge[] = [];
+    for (const line of out.split("\n")) {
+      if (!line.trim()) continue;
+      const [sha, parents, cISO, subject] = line.split("\x1f");
+      if (!sha || !cISO || seen.has(sha)) continue;
+      seen.add(sha);
+      const t = new Date(cISO).getTime();
+      if (!(t >= windowStart.getTime() && t < now.getTime())) continue;
+      const m = /^Merge pull request #(\d+) from (\S+)/.exec(subject ?? "");
+      const merge: DefaultRefMerge = { sha, parents: (parents ?? "").split(" ").filter(Boolean), timestamp: cISO, subject: subject ?? "" };
+      if (m) {
+        const remote = m[2]!;
+        const slash = remote.indexOf("/");
+        merge.pr = { number: Number(m[1]), branch: slash >= 0 ? remote.slice(slash + 1) : remote };
+      }
+      merges.push(merge);
+    }
+    return { merges, unread: false };
+  } catch (e) {
+    if (e instanceof GitTimeoutError) return unread;
+    throw e;
+  }
+}
+
+/** Spec §4.3 item 4: the members of each merge, `git rev-list <p1>..<p2>`, SERIALLY under the budget.
+ *  A merge whose `rev-list` the budget never reaches, or that is killed by its timeout
+ *  (`GitTimeoutError`), counts in `timedOut` — no facts, continue; any other throw propagates, which
+ *  is `exception` at the phase. `read` counts merges whose `rev-list` completed. `readPrFacts`
+ *  aggregates the three across repos. A merge with fewer than two parents has no range and is skipped
+ *  (counted in neither). */
+export async function mergeMembers(
+  repo: string, merges: readonly DefaultRefMerge[], budget: GitBudget,
+): Promise<{ members: Map<string, string[]>; read: number; timedOut: number }> {
+  const members = new Map<string, string[]>();
+  let read = 0, timedOut = 0;
+  for (const m of merges) {
+    const [p1, p2] = m.parents;
+    if (!p1 || !p2) continue;
+    const t = budget.callTimeoutMs();
+    if (t === undefined) { timedOut++; continue; }
+    try {
+      const out = await runGit(["rev-list", `${p1}..${p2}`], repo, t);
+      members.set(m.sha, out.split("\n").map((l) => l.trim()).filter(Boolean));
+      read++;
+    } catch (e) {
+      if (e instanceof GitTimeoutError) { timedOut++; continue; }
+      throw e;
+    }
+  }
+  return { members, read, timedOut };
 }

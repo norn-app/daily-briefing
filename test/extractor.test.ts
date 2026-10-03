@@ -8,6 +8,7 @@ import { resumptionSignals, runGit } from "../src/git";
 import { gitActivity } from "../src/extractor";
 import { blockedDelivery } from "../src/core";
 import { eventIdFor } from "../src/eventId";
+import { removeAtRunEnd } from "./fixtures/temp-dirs";
 
 const yesterdayISO = () => new Date(Date.now() - 864e5).toISOString(); // ~yesterday, always prior local day
 
@@ -62,14 +63,6 @@ test("resumptionSignals timestamps a stash with the stash's own date, not run ti
   // stash commit dates are second-granular (%cI); compare at seconds, not the fixture's ms.
   const secs = (t: string) => Math.floor(new Date(t).getTime() / 1000);
   expect(secs(stash!.timestamp!)).toBe(secs(stashDate));
-});
-
-test("resumptionSignals captures a stash", async () => {
-  const repo = await buildRepo([{ file: "a.txt", content: "a", isoDate: yesterdayISO() }]);
-  await Bun.write(`${repo}/a.txt`, "changed");
-  await runGit(["stash"], repo);
-  const sigs = await resumptionSignals(repo);
-  expect(sigs.some((s) => s.kind === "stash")).toBe(true);
 });
 
 test("resumptionSignals renders a detached HEAD as 'Detached HEAD at <sha7>', not 'On branch HEAD'", async () => {
@@ -149,8 +142,8 @@ test("gitActivity returns tcc-denied repos in issues (drives the all-blocked che
   expect(activities.length).toBe(0);
 });
 
-test("resumptionSignals doesn't throw on an unborn-HEAD repo (zero commits): still reports uncommitted, best-effort branch, no stash", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "dba-empty-repo-"));
+test("resumptionSignals doesn't throw on an unborn-HEAD repo (zero commits): still reports uncommitted, the branch, no stash", async () => {
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-empty-repo-")));
   await runGit(["init", "-q", "-b", "main"], dir);
   await runGit(["config", "user.name", "Test"], dir);
   await runGit(["config", "user.email", "test@example.com"], dir);
@@ -159,13 +152,17 @@ test("resumptionSignals doesn't throw on an unborn-HEAD repo (zero commits): sti
   const sigs = await resumptionSignals(dir);
   expect(sigs.some((s) => s.kind === "uncommitted")).toBe(true);
   expect(sigs.some((s) => s.kind === "stash")).toBe(false);
-  // branch name is best-effort via symbolic-ref even with no commits; if it resolves it's "main"
+  // The branch name resolves via symbolic-ref even with no commits, so the signal is REQUIRED here,
+  // not best-effort: the old `if (branchSig) expect(...)` skipped its only assertion whenever the
+  // signal was missing, which is exactly the regression it should catch (measured 2026-09-24:
+  // dropping the branch push entirely left this test green).
   const branchSig = sigs.find((s) => s.kind === "branch");
-  if (branchSig) expect(branchSig.target).toBe("main");
+  expect(branchSig).toBeDefined();
+  expect(branchSig!.target).toBe("main");
 });
 
 test("gitActivity surfaces uncommitted work from a valid repo with ZERO commits (unborn HEAD), and does not mislabel it not-git", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "dba-empty-repo-"));
+  const dir = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-empty-repo-")));
   await runGit(["init", "-q", "-b", "main"], dir);
   await runGit(["config", "user.name", "Test"], dir);
   await runGit(["config", "user.email", "test@example.com"], dir);
@@ -231,7 +228,7 @@ test("gitActivity is deterministic and repo-ordered under concurrency (multi-rep
 
 test("gitActivity dedupes commits shared by a linked worktree (no double-recap), keeps the worktree's own working state [Tier-A]", async () => {
   const repo = await buildRepo([{ file: "a.txt", content: "a", isoDate: yesterdayISO() }]);
-  const wtBase = mkdtempSync(join(tmpdir(), "dba-wt-"));
+  const wtBase = removeAtRunEnd(mkdtempSync(join(tmpdir(), "dba-wt-")));
   const wt = join(wtBase, "worktree");
   await runGit(["worktree", "add", "-b", "feature", wt], repo); // shares repo's object store + refs
   await Bun.write(join(repo, "a.txt"), "changed");             // stash a change in the MAIN checkout

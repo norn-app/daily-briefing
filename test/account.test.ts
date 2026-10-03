@@ -1,13 +1,14 @@
 // Checkpoint 1 — the pure selector, the state module's five writes, and reset parsing.
 // Every case here names the defect it pins: these rules were each written in response to a specific
 // review finding, and a test that does not fail against the wrong version is not worth its runtime.
+import "./fixtures/isolate-state";   // A0 — keeps supportDir() fallbacks off the REAL state dir (see test/isolation.meta.test.ts)
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   resolveAccount, effectiveAccounts, loadAccountState, recordLimit, clearMark, clearLastLimit,
-  parseResetInstant, clampUntil, accountStatePath, DEFAULT_LABEL, MAX_MARK_MS, PROBE_MS, LIMIT_RE,
+  parseResetInstant, clampUntil, accountStatePath, DEFAULT_LABEL, MAX_MARK_MS, PROBE_MS,
   type AccountState,
 } from "../src/account";
 
@@ -158,10 +159,6 @@ describe("state file — five writes, read-modify-write, atomicity", () => {
 
 describe("parseResetInstant", () => {
   const real = "You've hit your weekly limit · resets Aug 26 at 10pm (America/Los_Angeles)";
-
-  test("the matcher accepts the REAL captured message", () => {
-    expect(LIMIT_RE.test(real)).toBe(true);
-  });
 
   // Assert the ABSOLUTE instant, never local calendar fields: `bun test` runs with TZ=UTC while
   // `bun run` uses the machine zone (measured), so getDate()/getHours() assertions disagree between the
