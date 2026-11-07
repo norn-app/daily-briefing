@@ -50,8 +50,6 @@ page; [docs/INSTALL.md](docs/INSTALL.md) has the steps for each platform.
 - **Desktop app:** a `.dmg` for macOS (Apple silicon or Intel), and an AppImage or a `.deb` for Linux
   (x86_64). The macOS app is not notarized, so its first open needs **Open Anyway** in System Settings
   ([how](docs/INSTALL.md#macos-the-desktop-app)).
-- **Homebrew** (the command-line tool, macOS and Linux):
-  `brew install themarigold/tap/daily-briefing`.
 - **A single binary** for macOS, Linux or Windows (experimental). Check it against `SHA256SUMS` before
   running it ([commands](docs/INSTALL.md#the-command-line-binary)).
 - **From source**, with [Bun](https://bun.sh): [docs/INSTALL.md](docs/INSTALL.md#from-a-source-checkout).
@@ -277,8 +275,7 @@ Further reading:
 
 ## Links
 
-- [Releases](https://github.com/themarigold/daily-briefing/releases) and the
-  [Homebrew tap](https://github.com/themarigold/homebrew-tap).
+- [Releases](https://github.com/themarigold/daily-briefing/releases).
 - [CONTRIBUTING.md](CONTRIBUTING.md): the stack, setup, tests and how to send a change.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability privately.
 - [docs/gui-seam.md](docs/gui-seam.md): the design contract between the desktop app and the engine.

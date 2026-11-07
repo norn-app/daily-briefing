@@ -7,7 +7,6 @@ page. Pick one row:
 | --- | --- | --- |
 | A Mac, and want the desktop app | `daily-briefing-<version>-darwin-arm64.dmg` (Apple silicon) or `daily-briefing-<version>-darwin-x64.dmg` (Intel) | [macOS: the desktop app](#macos-the-desktop-app) |
 | Linux (x86_64), and want the desktop app | `daily-briefing-<version>-linux-x86_64.AppImage`, or `daily-briefing_<version>_amd64.deb` for Debian and Ubuntu | [Linux: the AppImage](#linux-the-appimage), [Linux: the .deb](#linux-the-deb) |
-| Homebrew, and want the command-line tool | `brew install themarigold/tap/daily-briefing` | [Homebrew](#homebrew-macos-and-linux) |
 | Any platform, and want just the command-line tool | `daily-briefing-darwin-arm64`, `-darwin-x64`, `-linux-x64`, `-linux-arm64` or `-windows-x64.exe` | [The command-line binary](#the-command-line-binary) |
 | Windows | the command-line binary only, experimental | [Windows](#windows-command-line-binary-only-experimental) |
 
@@ -82,16 +81,6 @@ whether the app should start when you log in (ticked by default; nothing is regi
 press Finish). To use the same engine
 from a terminal, open **Settings › This app › Command-line tool**; it links `daily-briefing` in
 `/usr/local/bin` to the engine copy the scheduler runs.
-
-## Homebrew (macOS and Linux)
-
-Homebrew installs the command-line tool, not the desktop app:
-
-```sh
-brew install themarigold/tap/daily-briefing
-daily-briefing init               # writes the config; see "First run" in the README
-daily-briefing schedule install   # optional: deliver it every morning
-```
 
 ## The command-line binary
 
@@ -271,7 +260,6 @@ Remove the schedule first, then the program, then (if you want) your data.
      for where it looks on Linux). Then remove the app itself: on
      macOS, move Daily Briefing from Applications to the Trash; on Linux, the .deb or AppImage step
      below.
-   - **Homebrew:** `brew uninstall daily-briefing`.
    - **The command-line binary:** delete the file you downloaded.
    - **The .deb:** `sudo apt remove daily-briefing`.
    - **The AppImage:** delete the `.AppImage` file.
